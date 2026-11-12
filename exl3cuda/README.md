@@ -54,6 +54,17 @@ Production = the Qwen3.8-27B RTX 5090 service (int4_per_token_head KV, MTP k = 7
 | `EXL3_RC_FUSED_IN` | 1 | RC-FUSED-IN: q/k/v split, gating and output write inside the recompute kernel |
 | `EXL3_RC_SLICE` | 1 | RC-SLICE: mixed steps use views for the non-spec rows instead of gather/scatter (bit-identical) |
 | `EXL3_RC_BV / EXL3_RC_WARPS` | default (32 / 4) | recompute kernel tile / warps |
+| `EXL3_KSMOOTH` | path to a K-mean table | KSMOOTH: store K - mean (per layer / KV head / channel) in the quantized KV cache; softmax unchanged |
+| `EXL3_KSMOOTH_CALIB` | unset | KSMOOTH calibration: accumulate key means of real traffic (eager engine) and save the table to this path |
+| `EXL3_KSMOOTH_ROBUST` | default (1) | calibration ignores token-heads with key norm > 3x the median (attention sinks) |
+
+## Data files you supply
+
+These are derived from a deployment's own traffic or weights and are not part of the package:
+
+- **K smoothing table** (`EXL3_KSMOOTH`): not shipped. Generate it on your own traffic: run the engine eagerly
+  (`--enforce-eager`) with `EXL3_KSMOOTH_CALIB=<out.pt>` (and int8 KV) over representative prompts; the plugin saves
+  `{layer_name: mean[H, D]}` every 64 calls. Then serve with `EXL3_KSMOOTH=<out.pt>`.
 
 ## Licenses
 

@@ -578,6 +578,72 @@ def _(x, layer_id, n):
 
 
 # ------------------------------------------------------------------------------------------------
+# KSMOOTH (same code as the XPU plugin): K smoothing for int8_per_token_head KV (pure torch, no kernels).
+
+def _patch_ksmooth():
+    try:
+        from vllm.v1.attention.backends.triton_attn import TritonAttentionImpl
+        from vllm.v1.kv_cache_interface import KVQuantMode
+    except Exception as e:  # noqa
+        logger.warning("exl3: K smoothing not installed (%s)", e)
+        return
+    if getattr(TritonAttentionImpl, "_exl3_ks_patched", False):
+        return
+    # K smoothing (SageAttention): store K - m (per layer / kv head / channel constant). Q.(K - m) = Q.K - Q.m and Q.m is
+    # the same for every key of a query, so softmax is unchanged; m removes the common channel offsets / outliers that
+    # eat the per-token int8 range (attention sinks). EXL3_KSMOOTH=<file> applies, EXL3_KSMOOTH_CALIB=<file> measures
+    # (eager engine only: accumulates key sums of real tokens and saves {layer: mean[H, D]}).
+    ks_path, cal_path = os.environ.get("EXL3_KSMOOTH"), os.environ.get("EXL3_KSMOOTH_CALIB")
+    if ks_path or cal_path:
+        orig_upd = TritonAttentionImpl.do_kv_cache_update
+        kmeans = {}
+        if ks_path:
+            try:
+                kmeans = {k: v for k, v in torch.load(ks_path, map_location="cpu").items()}
+                logger.info("exl3: K smoothing on (%d layers from %s)", len(kmeans), ks_path)
+            except Exception as e:  # noqa
+                logger.warning("exl3: K smoothing file %s not loaded (%s)", ks_path, e)
+        cal = {"n": 0}
+
+        def do_kv_cache_update(self, layer, key, value, kv_cache, slot_mapping):
+            name = getattr(layer, "layer_name", None)
+            qm = getattr(self, "_kv_quant_mode", None)
+            if (qm == KVQuantMode.INT8_PER_TOKEN_HEAD and name is not None):
+                if cal_path:
+                    valid = slot_mapping[: key.shape[0]] >= 0
+                    ks = key[: valid.shape[0]][valid].float()
+                    if ks.shape[0] > 8 and os.environ.get("EXL3_KSMOOTH_ROBUST", "1") == "1":
+                        # robust: drop token-heads whose key norm exceeds 3x the median (attention sinks / massive
+                        # activations would otherwise dominate the mean and offset every normal key)
+                        nrm = ks.norm(dim=-1)                                  # [T, H]
+                        keep = nrm <= 3.0 * nrm.median(dim=0, keepdim=True).values
+                        ks = ks * keep.unsqueeze(-1)
+                        cnt = keep.sum(0).double().cpu()                      # [H]
+                        acc = cal.setdefault(name, [torch.zeros(key.shape[1:], dtype=torch.float64), torch.zeros(key.shape[1], dtype=torch.float64)])
+                        acc[0] += ks.sum(0).double().cpu(); acc[1] += cnt
+                        cal["n"] += 1
+                        if cal["n"] % 64 == 0:
+                            torch.save({k: (v[0] / v[1].clamp_min(1).unsqueeze(-1)).float() for k, v in cal.items() if k != "n"}, cal_path)
+                        ks = ks[:0]
+                    if ks.numel():
+                        acc = cal.setdefault(name, [torch.zeros(key.shape[1:], dtype=torch.float64), 0])
+                        acc[0] += ks.sum(0).double().cpu(); acc[1] += ks.shape[0]
+                        cal["n"] += 1
+                        if cal["n"] % 64 == 0:
+                            torch.save({k: (v[0] / max(1, v[1])).float() for k, v in cal.items() if k != "n"}, cal_path)
+                if name in kmeans:
+                    m = getattr(self, "_exl3_km", None)
+                    if m is None or m.device != key.device:
+                        m = self._exl3_km = kmeans[name].to(device=key.device, dtype=key.dtype)
+                    key = key - m
+            return orig_upd(self, layer, key, value, kv_cache, slot_mapping)
+
+        TritonAttentionImpl.do_kv_cache_update = do_kv_cache_update
+
+        TritonAttentionImpl._exl3_ks_patched = True
+
+
+# ------------------------------------------------------------------------------------------------
 # GDN-RECOMPUTE, CUDA port of the XPU plugin's _patch_gdn_recompute / _rc_dispatch: MTP spec decoding
 # for the 48 GDN layers with ONE committed SSM state per request
 # (Triton kernel exl3cuda.gdn_rc.gdn_recompute), so MambaSpec.num_speculative_blocks = 0 and a running request no
@@ -868,5 +934,6 @@ def register():
         except Exception as e:  # noqa: never block engine start; weights load from disk
             logger.warning("exl3: WHX not active (%s: %s)", type(e).__name__, e)
     _patch_block_align()
+    _patch_ksmooth()
     _patch_gdn_recompute()
     return None
