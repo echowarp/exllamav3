@@ -1332,6 +1332,36 @@ def _mix3d(md):
     return d
 
 
+def _patch_fastlaunch_eagle():
+    """FAST-LAUNCH (fastlaunch.py, LLMT_FASTLAUNCH=1; default off) for vLLM's per-draft-step
+    eagle_step_update_slot_mapping_and_metadata (same body, launch via fastlaunch.launch: bit-identical, ~7 launches
+    per decode step)."""
+    if os.environ.get("LLMT_FASTLAUNCH", "0") != "1":
+        return
+    try:
+        import vllm.v1.spec_decode.utils as U
+        import vllm.v1.spec_decode.llm_base_proposer as LBP
+        from .fastlaunch import launch as _fl
+        kern, PAD = U.eagle_step_slot_mapping_metadata_kernel, U.PADDING_SLOT_ID
+    except Exception as e:  # noqa
+        logger.warning("exl3: FAST-LAUNCH eagle step not installed (%s)", e)
+        return
+
+    def eagle_step_update_slot_mapping_and_metadata(positions_1d, block_table_tensor, seq_lens, block_size, max_model_len,
+                                                    out_clamped_positions, out_slot_mapping, input_batch_size=None):
+        batch_size = positions_1d.shape[0]
+        if input_batch_size is None:
+            input_batch_size = batch_size
+        _fl(kern, (input_batch_size,), positions_1d, block_table_tensor, block_table_tensor.stride(0), seq_lens,
+            out_clamped_positions, out_slot_mapping, block_size=block_size, max_model_len=max_model_len,
+            n_blocks_per_req=block_table_tensor.shape[1], PAD_ID=PAD, batch_size=batch_size)
+
+    U.eagle_step_update_slot_mapping_and_metadata = eagle_step_update_slot_mapping_and_metadata
+    if hasattr(LBP, "eagle_step_update_slot_mapping_and_metadata"):
+        LBP.eagle_step_update_slot_mapping_and_metadata = eagle_step_update_slot_mapping_and_metadata
+    logger.info("exl3: FAST-LAUNCH on (eagle step update, draft_scatter, DYN-ROW extras: cached CompiledKernel launches)")
+
+
 def _patch_int8kv_fa():
     if os.environ.get("EXL3_INT8KV_FA", "1") != "1":
         return
@@ -2230,6 +2260,7 @@ def register():
             logger.warning("exl3: GDN-PORT not active (%s: %s)", type(e).__name__, e)
     _patch_gdn_recompute()
     _patch_int8kv_fa()
+    _patch_fastlaunch_eagle()
     _patch_kvw4()
     if os.environ.get("EXL3_DRAFT_VOCAB"):
         _patch_mtp_draft_logits()

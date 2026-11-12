@@ -96,6 +96,7 @@ Production = the Qwen3.8-27B RTX 5090 service (int4_per_token_head KV, MTP k = 7
 | `EXL3_DRAFT_DYN / _NEAR` | 256 / 128 | DRAFT-DYN: up to E extra draft-head rows per request (its most frequent prompt tokens), far / near passes |
 | `EXL3_DRAFT_BIAS` | 0 | DRAFT-DYN: drafter logit bias on prompt tokens |
 | `EXL3_DRAFT_DYN_GS / _BG / _DELAY_US` | default (64 / 1 / 2000) | DRAFT-DYN host int4 group size, background uploads, upload delay |
+| `LLMT_FASTLAUNCH` | default (0) | FAST-LAUNCH (fastlaunch.py): cached Triton CompiledKernel launches for the draft-loop kernels (DYN-ROW extras, draft_scatter, vLLM's eagle step update); bit-identical, saves host time per step (single stream +0-1.9 % steps/s on an RTX 5090); not in the production configuration. `LLMT_FASTLAUNCH_CHECK=N` compares N draft_scatter launches with a plain launch |
 | `EXL3_DRAFT_WINDOW` | unset | DRAFT-WINDOW: sliding window for the MTP layer's attention (drafts only) |
 | `EXL3_CAPTURE_MTP_H / _EVERY` | unset | capture X^T X of the MTP linears' inputs for calibrated draft re-quantization (eager engine) |
 | `EXL3_TAIL_FUSE` | 1 | TAIL-FUSE: bit-exact trimming of the decode small-kernel tail; 1 = all parts or a list of cat, scratch, conv, ks, dlog |

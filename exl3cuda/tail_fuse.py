@@ -306,12 +306,26 @@ def _draft_scatter_kernel(sub_ptr, blk_ptr, out_ptr, n_rows, n_out, stride_sub, 
     tl.store(out_ptr + rows[:, None].to(tl.int64) * stride_out + b * BS + cols[None, :], v, mask=omask)
 
 
+# LLMT_FASTLAUNCH_CHECK=N: compare the next N fast launches of draft_scatter with a plain launch (bit-identical check)
+_FL_CHECK = [int(os.environ.get("LLMT_FASTLAUNCH_CHECK", "0"))]
+
+
 def draft_scatter(sub, inv, logits, BS=128):
     rows = logits.shape[0]
     RB = 1 if rows == 1 else (2 if rows == 2 else (4 if rows <= 4 else 8))
-    _draft_scatter_kernel[(triton.cdiv(rows, RB), inv.numel())](sub, inv, logits, rows, logits.shape[1], sub.stride(0),
-                                                                logits.stride(0), RB=RB, BS=BS,
-                                                                num_warps=1 if RB <= 2 else 4)
+    from .fastlaunch import launch as _fl
+    g = (triton.cdiv(rows, RB), inv.numel())
+    _fl(_draft_scatter_kernel, g, sub, inv, logits, rows, logits.shape[1], sub.stride(0), logits.stride(0), RB=RB, BS=BS,
+        num_warps=1 if RB <= 2 else 4)
+    if _FL_CHECK[0] > 0:
+        _FL_CHECK[0] -= 1
+        ref = torch.empty_like(logits)
+        _draft_scatter_kernel[g](sub, inv, ref, rows, ref.shape[1], sub.stride(0), ref.stride(0), RB=RB, BS=BS,
+                                 num_warps=1 if RB <= 2 else 4)
+        n = inv.numel() * BS
+        same = bool(torch.equal(ref[:, :n].view(torch.int16), logits[:, :n].view(torch.int16)))
+        if not same or _FL_CHECK[0] % 100 == 0:
+            logger.info("FAST-LAUNCH check draft_scatter: %s (%d left)", "bit-identical" if same else "DIFFERENT", _FL_CHECK[0])
 
 
 def _install_dlog(P):

@@ -263,9 +263,9 @@ def _full_logits_fast(sub, inv, n_out, width, vocab, h, W, Xs, XB, SB):
         hh = h if h.dtype == W.dtype else h.to(W.dtype)
         E, K = W.shape[1], W.shape[2]
         BE = 32
-        _dyn_extra_kernel[(B, triton.cdiv(E, BE))](W, hh, XB, Xs, out, E, K, W.stride(0), W.stride(1), hh.stride(0),
-                                                    XB.stride(0), Xs.stride(0), out.stride(0), BE=BE, BK=256,
-                                                    num_warps=4)
+        from .fastlaunch import launch as _fl
+        _fl(_dyn_extra_kernel, (B, triton.cdiv(E, BE)), W, hh, XB, Xs, out, E, K, W.stride(0), W.stride(1), hh.stride(0),
+            XB.stride(0), Xs.stride(0), out.stride(0), BE=BE, BK=256, num_warps=4)
     return out[:, :vocab]
 
 
