@@ -22,6 +22,7 @@ stock path in place. Some features need companion patches to vLLM itself (noted 
 | `exl3_mma.py` | Triton EXL3 GEMM for 17-64 rows (decode each weight tile once per program) |
 | `vllm_plugin.py` | the vLLM plugin: `exl3` quantization config, linear methods, custom op `exl3cuda::linear` and all engine patches |
 | `gdn_rc.py` | Triton GDN recompute kernels |
+| `i8fa_prefill.py`, `csrc/i8fa/` | I8FA int8-KV prefill helpers and kernels |
 | `csrc/fa16/` | FA16 FlashAttention 2 variant (patch + binding + build) |
 
 Built kernels go to `exl3cuda/lib/` (ignored by git, installed as package data).
@@ -62,6 +63,9 @@ Production = the Qwen3.8-27B RTX 5090 service (int4_per_token_head KV, MTP k = 7
 | `EXL3_INT8KV_KB` | default (32768) | INT8KV-FA / I4FA: context tokens dequantized per FA2 call (merged by log-sum-exp) |
 | `EXL3_VERIFY_Q` | 8 | query rows per request treated as decode / verify (k = 7 verify = 8) |
 | `EXL3_FA16` | f | FA16: route those FA2 calls to the fp16-accumulate build (b = P.V fp16, f = b + Q.K fp16); unset = stock FA2 |
+| `EXL3_I8FA` | 1 | I8FA: CUDA gather-dequant + LSE merge around the same FA2 calls (bitwise equal), paged in-kernel-dequant FA2 for few rows |
+| `EXL3_I8FA_DIR` | default (`<package>/lib`) | directory with `i8kv/`, `i8fa_fp/`, `i8fa_a/` |
+| `EXL3_I8FA_PAGED_MAXQ` | auto | paged route: auto = Q <= 128 and >= 3 parts, N = Q <= N, 0 = off |
 
 ## Building the kernels
 
@@ -80,6 +84,13 @@ vllm-project/flash-attention `caaa4eb5` (vLLM 0.26.0's pin) + CUTLASS, patched w
     export PYTHONPATH=$PWD/../../lib/fa_f:$PYTHONPATH   # the plugin imports module fa_f (or from /fa16ext/fa_f)
 
 One nvcc needs ~12 GB RAM (`MAX_JOBS=1`); `build-seq.sh fa_f:1:2 fa_b:1:0` builds variants one at a time.
+
+### I8FA (`csrc/i8fa`)
+
+    cd exl3cuda/csrc/i8fa
+    python3 build.py i8kv            # gather-dequant + merge -> lib/i8kv/i8kv.so
+    python3 build.py i8fa_fp 1 2     # paged FA2, FA16 f numerics (needs ../fa16/fetch_and_patch.sh first)
+    python3 build.py i8fa_a 0 0      # paged FA2, stock numerics (used when EXL3_FA16 is unset)
 
 ## Data files you supply
 

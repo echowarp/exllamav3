@@ -706,7 +706,20 @@ def _fa(q, k, v, causal, scale):
                                   return_softmax_lse=True)
 
 
+# I8FA (kernels: csrc/i8fa): EXL3_I8FA=1 = fused CUDA gather-dequant + LSE merge around the same FA2
+# calls (bitwise equal); module exl3cuda/i8fa_prefill.py, kernels in EXL3_I8FA_DIR. Unset / failure = the code below.
+try:
+    from exl3cuda import i8fa_prefill as _i8fa_mod
+    _I8FA = _i8fa_mod if _i8fa_mod.setup(_FA16_V if _FA16 is not None else "") else None
+except Exception as _e:  # noqa
+    _I8FA = None
+    if os.environ.get("EXL3_I8FA", "0") == "1":
+        logger.warning("exl3: I8FA module not loaded (%s)", _e)
+
+
 def _i8_prefill_fa(q, key_cache, value_cache, pages, seq_len, scale, out):
+    if _I8FA is not None and _I8FA.prefill(q, key_cache, value_cache, pages, seq_len, scale, out, _fa, _FA_KB) is not None:
+        return out
     Q, bs = q.shape[0], key_cache.shape[1]
     prefix = seq_len - Q
     parts = []
