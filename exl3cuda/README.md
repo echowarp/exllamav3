@@ -22,6 +22,7 @@ stock path in place. Some features need companion patches to vLLM itself (noted 
 | `exl3_mma.py` | Triton EXL3 GEMM for 17-64 rows (decode each weight tile once per program) |
 | `vllm_plugin.py` | the vLLM plugin: `exl3` quantization config, linear methods, custom op `exl3cuda::linear` and all engine patches |
 | `gdn_rc.py` | Triton GDN recompute kernels |
+| `csrc/fa16/` | FA16 FlashAttention 2 variant (patch + binding + build) |
 
 Built kernels go to `exl3cuda/lib/` (ignored by git, installed as package data).
 
@@ -57,6 +58,28 @@ Production = the Qwen3.8-27B RTX 5090 service (int4_per_token_head KV, MTP k = 7
 | `EXL3_KSMOOTH` | path to a K-mean table | KSMOOTH: store K - mean (per layer / KV head / channel) in the quantized KV cache; softmax unchanged |
 | `EXL3_KSMOOTH_CALIB` | unset | KSMOOTH calibration: accumulate key means of real traffic (eager engine) and save the table to this path |
 | `EXL3_KSMOOTH_ROBUST` | default (1) | calibration ignores token-heads with key norm > 3x the median (attention sinks) |
+| `EXL3_INT8KV_FA` | default (1) | INT8KV-FA: prefill rows (> EXL3_VERIFY_Q per request) on block-dequantized FA2 instead of Triton unified attention (int8_per_token_head KV) |
+| `EXL3_INT8KV_KB` | default (32768) | INT8KV-FA / I4FA: context tokens dequantized per FA2 call (merged by log-sum-exp) |
+| `EXL3_VERIFY_Q` | 8 | query rows per request treated as decode / verify (k = 7 verify = 8) |
+| `EXL3_FA16` | f | FA16: route those FA2 calls to the fp16-accumulate build (b = P.V fp16, f = b + Q.K fp16); unset = stock FA2 |
+
+## Building the kernels
+
+All kernels are sm_120 (RTX 5090) builds through `torch.utils.cpp_extension` (no GPU needed to compile). If your CUDA
+toolkit lacks headers that torch includes (cuSPARSE / cuSOLVER / cuFFT, e.g. in a runtime container), pass their
+directory in `EXL3_EXTRA_INC` (FA16 / I8FA builds).
+
+### FA16 (`csrc/fa16`)
+
+FlashAttention 2 forward (hdim 256, fp16, 64 x 64 tile) with fp16-accumulate MMAs, built against
+vllm-project/flash-attention `caaa4eb5` (vLLM 0.26.0's pin) + CUTLASS, patched with `srcmod.diff`:
+
+    cd exl3cuda/csrc/fa16
+    ./fetch_and_patch.sh            # clones FA2 + cutlass, writes ./srcmod
+    python3 build.py fa_f 1 2       # production variant f -> exl3cuda/lib/fa_f/fa_f.so  (fa_b: 1 0)
+    export PYTHONPATH=$PWD/../../lib/fa_f:$PYTHONPATH   # the plugin imports module fa_f (or from /fa16ext/fa_f)
+
+One nvcc needs ~12 GB RAM (`MAX_JOBS=1`); `build-seq.sh fa_f:1:2 fa_b:1:0` builds variants one at a time.
 
 ## Data files you supply
 

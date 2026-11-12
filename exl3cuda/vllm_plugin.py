@@ -644,6 +644,157 @@ def _patch_ksmooth():
 
 
 # ------------------------------------------------------------------------------------------------
+# INT8KV-FA (CUDA port of the XPU plugin's block-dequantized FA2 prefill): with int8_per_token_head KV,
+# vLLM's Triton unified attention runs prefill chunks at ~35-40 TFLOPS on the 5090 (30% of prefill time in the
+# profile). Requests with more than 8 query rows instead read their whole context from the cache (int8 rows
+# [256 | f32 scale], same bytes the Triton kernel reads), dequantize it to fp16 in blocks of EXL3_INT8KV_KB tokens and
+# run vllm_flash_attn's FA2 varlen (head 256, ~200 TFLOPS), merging blocks by log-sum-exp. Rows with <= 8 query
+# tokens (decode / spec verify) in the same batch go to the Triton kernel as a sub-batch; pure decode batches (and
+# the FULL CUDA-graph decode path) are untouched. EXL3_INT8KV_FA=0 disables.
+_FA_KB = int(os.environ.get("EXL3_INT8KV_KB", "32768"))
+
+
+def _i8_gather_dequant(cache, pages, bs, start, end):
+    """cache: per-token-head view [blocks, BS, H, 260] int8 (data 0..255, f32 scale at 256..259) -> fp16 [n, H, 256]."""
+    p0, p1 = start // bs, (end + bs - 1) // bs
+    blk = cache.index_select(0, pages[p0:p1]).flatten(0, 1)
+    off = start - p0 * bs
+    x = blk[off: off + (end - start)]
+    sc = x[..., 256:260].contiguous().view(torch.float32)
+    return (x[..., :256].to(torch.float32) * sc).to(torch.float16)
+
+
+_FA_CU: dict = {}   # (n, device) -> int32 [0, n] on the device (FA-CU cache)
+
+
+def _fa_cu(n: int, device):
+    """cu_seqlens [0, n] on the device, cached. torch.tensor([...], device=...) copies from pageable host memory, which
+    is a synchronous copy (the CPU waits until the stream has drained): per attention layer per prefill step it was
+    5.3% of the EngineCore's samples at 4 streams (py-spy)."""
+    t = _FA_CU.get((n, device))
+    if t is None:
+        if len(_FA_CU) > 8192:
+            _FA_CU.clear()
+        t = _FA_CU[(n, device)] = torch.tensor([0, n], dtype=torch.int32, device=device)
+    return t
+
+
+# FA16 (kernels: csrc/fa16): EXL3_FA16=b|f routes the int8-KV prefill FA2 calls to a pruned
+# FA2 build (hdim 256 fp16, 64x64 tile) with fp16-accumulate MMAs: b = P.V fp16 per 64-key block into the fp32 acc_o,
+# f = b + Q.K fp16 per 64 dims flushed to fp32. Numerics change (not bitwise); unset = stock FA2.
+_FA16_V = os.environ.get("EXL3_FA16", "").strip().lower()
+_FA16 = None
+if _FA16_V in ("b", "f"):
+    try:
+        import importlib, sys as _sys
+        _sys.path.insert(0, f"/fa16ext/fa_{_FA16_V}")
+        _FA16 = importlib.import_module(f"fa_{_FA16_V}")
+        logger.info("exl3: FA16 on (variant %s)", _FA16_V)
+    except Exception as e:  # noqa
+        logger.warning("exl3: FA16 %s unavailable (%s); stock FA2", _FA16_V, e)
+        _FA16 = None
+
+
+def _fa(q, k, v, causal, scale):
+    from vllm.vllm_flash_attn import flash_attn_varlen_func
+    Q, L = q.shape[0], k.shape[0]
+    cq = _fa_cu(Q, q.device)
+    ck = _fa_cu(L, q.device)
+    if _FA16 is not None and q.dtype == torch.float16 and q.shape[-1] == 256:
+        return tuple(_FA16.fwd(q, k, v, cq, ck, Q, L, scale, causal))
+    return flash_attn_varlen_func(q, k, v, Q, cq, L, cu_seqlens_k=ck, causal=causal, softmax_scale=scale,
+                                  return_softmax_lse=True)
+
+
+def _i8_prefill_fa(q, key_cache, value_cache, pages, seq_len, scale, out):
+    Q, bs = q.shape[0], key_cache.shape[1]
+    prefix = seq_len - Q
+    parts = []
+    for s0 in range(0, prefix, _FA_KB):
+        e0 = min(s0 + _FA_KB, prefix)
+        parts.append(_fa(q, _i8_gather_dequant(key_cache, pages, bs, s0, e0),
+                         _i8_gather_dequant(value_cache, pages, bs, s0, e0), False, scale))
+    parts.append(_fa(q, _i8_gather_dequant(key_cache, pages, bs, prefix, seq_len),
+                     _i8_gather_dequant(value_cache, pages, bs, prefix, seq_len), True, scale))
+    if len(parts) == 1:
+        out.copy_(parts[0][0])
+        return out
+    lses = torch.stack([pp[1] for pp in parts])            # [n, H, Q]
+    m = lses.amax(0)
+    w = torch.exp(lses - m)                                 # [n, H, Q]
+    num = sum(pp[0].float() * wi.transpose(0, 1).unsqueeze(-1) for pp, wi in zip(parts, w))
+    out.copy_((num / w.sum(0).transpose(0, 1).unsqueeze(-1)).to(out.dtype))
+    return out
+
+
+def _patch_int8kv_fa():
+    if os.environ.get("EXL3_INT8KV_FA", "1") != "1":
+        return
+    try:
+        from vllm.v1.attention.backends.triton_attn import TritonAttentionImpl
+        from vllm.v1.kv_cache_interface import KVQuantMode
+        from vllm.v1.attention.ops.triton_unified_attention import unified_attention
+    except Exception as e:  # noqa
+        logger.warning("exl3: int8 KV FA prefill not installed (%s)", e)
+        return
+    if getattr(TritonAttentionImpl, "_exl3_fa_patched", False):
+        return
+    orig = TritonAttentionImpl.forward
+    # rows per request up to this count are decode / verify rows (FA prefill only above). 8 = k=7 verify; a 23-token
+    # prompt-lookup draft verifies 1 + 23 rows: EXL3_VERIFY_Q=24, else its CUDA-graph capture would take the prefill path.
+    VQ = int(os.environ.get("EXL3_VERIFY_Q", "8"))
+
+    def forward(self, layer, query, key, value, kv_cache, attn_metadata, output, output_scale=None,
+                output_block_scale=None):
+        md = attn_metadata
+        if (md is None or md.max_query_len <= VQ or not getattr(self, "_is_per_token_head_quant", False)
+                or self._kv_quant_mode != KVQuantMode.INT8_PER_TOKEN_HEAD or self.head_size != 256
+                or output_scale is not None or output_block_scale is not None or self.alibi_slopes is not None
+                or self.sinks is not None or getattr(md, "mm_prefix_range_tensor", None) is not None
+                or self.sliding_window not in (None, (-1, -1)) or not getattr(md, "causal", True)):
+            return orig(self, layer, query, key, value, kv_cache, md, output, output_scale, output_block_scale)
+        key_cache, value_cache = self._pth_key_value_caches(kv_cache)
+        T = md.num_actual_tokens
+        nr = md.query_start_loc.shape[0] - 1
+        H = self.num_heads
+        q = query[:T].view(-1, H, 256)
+        out = output[:T].view(-1, H, 256)
+        # the metadata carries CPU copies (query_start_loc_cpu / seq_lens_cpu) on this vLLM; use them instead of a
+        # device->host sync per mixed step (py-spy: 13-18% of the main thread's wait time; under async scheduling the
+        # sync also stops the CPU from preparing the next step). Falls back to the sync when a copy is missing.
+        qcpu = getattr(md, "query_start_loc_cpu", None)
+        qsl = qcpu[: nr + 1].tolist() if qcpu is not None and qcpu.shape[0] >= nr + 1 else md.query_start_loc[: nr + 1].cpu().tolist()
+        scpu = getattr(md, "seq_lens_cpu", None)
+        sl = scpu[:nr].tolist() if scpu is not None and scpu.shape[0] >= nr else md.seq_lens[:nr].cpu().tolist()
+        short = [i for i in range(nr) if 0 < qsl[i + 1] - qsl[i] <= VQ]
+        for i in range(nr):
+            a, b = qsl[i], qsl[i + 1]
+            if b - a > VQ:
+                _i8_prefill_fa(q[a:b], key_cache, value_cache, md.block_table[i].to(torch.int32), sl[i],
+                               float(self.scale), out[a:b])
+        if short:                                               # decode / verify rows next to the chunk
+            idx = torch.tensor(short, device=q.device)
+            rows = torch.cat([torch.arange(qsl[i], qsl[i + 1]) for i in short]).to(q.device)
+            lens = [qsl[i + 1] - qsl[i] for i in short]
+            cu = torch.tensor([0] + list(itertools.accumulate(lens)), dtype=torch.int32, device=q.device)
+            qs = q.index_select(0, rows).contiguous()
+            os_ = torch.empty_like(qs)
+            unified_attention(q=qs, k=key_cache, v=value_cache, out=os_, cu_seqlens_q=cu, max_seqlen_q=max(lens),
+                              seqused_k=md.seq_lens.index_select(0, idx), max_seqlen_k=max(sl[i] for i in short),
+                              softmax_scale=self.scale, causal=True, alibi_slopes=None, window_size=(-1, -1),
+                              block_table=md.block_table.index_select(0, idx), softcap=self.logits_soft_cap,
+                              q_descale=None, k_descale=None, v_descale=None,
+                              kv_quant_mode=self._kv_quant_mode,
+                              k_scale_cache=self._k_scale_cache, v_scale_cache=self._v_scale_cache)
+            out.index_copy_(0, rows, os_)
+        return output
+
+    TritonAttentionImpl.forward = forward
+    TritonAttentionImpl._exl3_fa_patched = True
+    logger.info("exl3: int8 KV prefill via block-dequantized FA2 (blocks of %d tokens)", _FA_KB)
+
+
+# ------------------------------------------------------------------------------------------------
 # GDN-RECOMPUTE, CUDA port of the XPU plugin's _patch_gdn_recompute / _rc_dispatch: MTP spec decoding
 # for the 48 GDN layers with ONE committed SSM state per request
 # (Triton kernel exl3cuda.gdn_rc.gdn_recompute), so MambaSpec.num_speculative_blocks = 0 and a running request no
@@ -936,4 +1087,5 @@ def register():
     _patch_block_align()
     _patch_ksmooth()
     _patch_gdn_recompute()
+    _patch_int8kv_fa()
     return None

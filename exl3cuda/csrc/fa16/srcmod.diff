@@ -1,0 +1,198 @@
+--- a/flash_fwd_kernel.h
++++ b/flash_fwd_kernel.h
+@@ -21,6 +21,63 @@
+ #include "dropout.h"
+ #include "rotary.h"
+ 
++
++#ifndef FA16_PV
++#define FA16_PV 0
++#endif
++#ifndef FA16_QK
++#define FA16_QK 0
++#endif
++namespace FLASH_NAMESPACE {
++template<int kNWarps>
++using TiledMmaH16 = cute::TiledMMA<cute::MMA_Atom<cute::SM80_16x8x16_F16F16F16F16_TN>,
++                                   cute::Layout<cute::Shape<cute::Int<kNWarps>, cute::_1, cute::_1>>,
++                                   cute::Tile<cute::Int<16 * kNWarps>, cute::_16, cute::_16>>;
++// FA16_PV 1: P.V of one KV block in fp16 MMA accumulate, added into the fp32 acc_o (fp16 only over kBlockN keys).
++template<int kNWarps, typename AccO, typename TP, typename TV, typename SV, typename CopyV, typename ThrV>
++__forceinline__ __device__ void pv_gemm(AccO &acc_o, TP &tOrP, TV &tOrVt, SV const &tOsVt, CopyV cv, ThrV tv, int tidx) {
++#if FA16_PV == 1
++    TiledMmaH16<kNWarps> mh;
++    Tensor acc_h = make_fragment_like<cutlass::half_t>(acc_o);
++    clear(acc_h);
++    gemm_rs(acc_h, tOrP, tOrVt, tOsVt, mh, cv, tv);
++    #pragma unroll
++    for (int i = 0; i < size(acc_o); ++i) acc_o(i) += float(acc_h(i));
++#elif FA16_PV == 2
++    TiledMmaH16<kNWarps> mh;
++    gemm_rs(acc_o, tOrP, tOrVt, tOsVt, mh, cv, tv);
++#endif
++}
++}  // namespace FLASH_NAMESPACE
++
++namespace FLASH_NAMESPACE {
++// FA16_QK 2: Q.K in fp16 MMA accumulate over 64 head dims (4 k-steps), flushed into the fp32 acc_s (fp16 sums of 64 terms).
++template<bool A_in_regs, int kNWarps, typename Tensor0, typename Tensor1, typename Tensor2, typename Tensor3, typename Tensor4,
++         typename TiledCopyA, typename TiledCopyB, typename ThrCopyA, typename ThrCopyB>
++__forceinline__ __device__ void gemm_qk_chunk(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Tensor3 const& tCsA,
++                            Tensor4 const& tCsB, TiledCopyA smem_tiled_copy_A, TiledCopyB smem_tiled_copy_B,
++                            ThrCopyA smem_thr_copy_A, ThrCopyB smem_thr_copy_B) {
++    TiledMmaH16<kNWarps> mh;
++    Tensor acc_h = make_fragment_like<cutlass::half_t>(acc);
++    Tensor tCrA_copy_view = smem_thr_copy_A.retile_D(tCrA);
++    Tensor tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB);
++    if (!A_in_regs) { cute::copy(smem_tiled_copy_A, tCsA(_, _, _0{}), tCrA_copy_view(_, _, _0{})); }
++    cute::copy(smem_tiled_copy_B, tCsB(_, _, _0{}), tCrB_copy_view(_, _, _0{}));
++    #pragma unroll
++    for (int i = 0; i < size<2>(tCrA); ++i) {
++        if (i < size<2>(tCrA) - 1) {
++            if (!A_in_regs) { cute::copy(smem_tiled_copy_A, tCsA(_, _, i + 1), tCrA_copy_view(_, _, i + 1)); }
++            cute::copy(smem_tiled_copy_B, tCsB(_, _, i + 1), tCrB_copy_view(_, _, i + 1));
++        }
++        if (i % 4 == 0) clear(acc_h);
++        cute::gemm(mh, tCrA(_, _, i), tCrB(_, _, i), acc_h);
++        if (i % 4 == 3) {
++            #pragma unroll
++            for (int j = 0; j < size(acc); ++j) acc(j) += float(acc_h(j));
++        }
++    }
++}
++}  // namespace FLASH_NAMESPACE
+ namespace FLASH_NAMESPACE {
+ 
+ using namespace cute;
+@@ -184,7 +241,8 @@
+ 
+     Tensor tSgS  = thr_mma.partition_C(gP);
+ 
+-    Tensor acc_o = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kHeadDim>>{});  // MMA, MMA_M, MMA_K
++    auto acc_o = [&] { if constexpr (FA16_PV == 2) { return partition_fragment_C(TiledMmaH16<Kernel_traits::kNWarps>{}, Shape<Int<kBlockM>, Int<kHeadDim>>{}); }
++                       else { return partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kHeadDim>>{}); } }();
+ 
+     //
+     // Copy Atom retiling
+@@ -316,10 +374,23 @@
+         }
+         cute::cp_async_fence();
+ 
++        if constexpr (FA16_QK == 0) {
+         FLASH_NAMESPACE::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
+             acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
+             smem_thr_copy_Q, smem_thr_copy_K
+         );
++        } else if constexpr (FA16_QK == 2) {
++        FLASH_NAMESPACE::gemm_qk_chunk<Kernel_traits::Is_Q_in_regs, Kernel_traits::kNWarps>(
++            acc_s, tSrQ, tSrK, tSsQ, tSsK, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K);
++        } else {
++        Tensor acc_sh = make_fragment_like<cutlass::half_t>(acc_s); clear(acc_sh);
++        FLASH_NAMESPACE::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
++            acc_sh, tSrQ, tSrK, tSsQ, tSsK, TiledMmaH16<Kernel_traits::kNWarps>{}, smem_tiled_copy_Q, smem_tiled_copy_K,
++            smem_thr_copy_Q, smem_thr_copy_K
++        );
++        #pragma unroll
++        for (int i = 0; i < size(acc_s); ++i) acc_s(i) = float(acc_sh(i));
++        }
+         // if (cute::thread0()) { print(acc_s); }
+         if constexpr (Is_softcap){
+             FLASH_NAMESPACE::apply_softcap(acc_s, params.softcap);
+@@ -364,7 +435,8 @@
+         // if using m16n8k16 or (4, MMA_M, MMA_N) if using m16n8k8.
+         Tensor tOrP = make_tensor(rP.data(), FLASH_NAMESPACE::convert_layout_acc_Aregs<typename Kernel_traits::TiledMma>(rP.layout()));
+         // if (cute::thread0()) { print(tOrP); }
+-        FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
++        if constexpr (FA16_PV == 0) { FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V); }
++        else { FLASH_NAMESPACE::pv_gemm<Kernel_traits::kNWarps>(acc_o, tOrP, tOrVt, tOsVt, smem_tiled_copy_V, smem_thr_copy_V, tidx); }
+         // if (cute::thread0()) { print(scores); }
+ 
+         // This check is at the end of the loop since we always have at least 1 iteration
+@@ -383,10 +455,23 @@
+         FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV);
+         cute::cp_async_fence();
+ 
++        if constexpr (FA16_QK == 0) {
+         FLASH_NAMESPACE::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
+             acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
+             smem_thr_copy_Q, smem_thr_copy_K
+         );
++        } else if constexpr (FA16_QK == 2) {
++        FLASH_NAMESPACE::gemm_qk_chunk<Kernel_traits::Is_Q_in_regs, Kernel_traits::kNWarps>(
++            acc_s, tSrQ, tSrK, tSsQ, tSsK, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K);
++        } else {
++        Tensor acc_sh = make_fragment_like<cutlass::half_t>(acc_s); clear(acc_sh);
++        FLASH_NAMESPACE::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
++            acc_sh, tSrQ, tSrK, tSsQ, tSsK, TiledMmaH16<Kernel_traits::kNWarps>{}, smem_tiled_copy_Q, smem_tiled_copy_K,
++            smem_thr_copy_Q, smem_thr_copy_K
++        );
++        #pragma unroll
++        for (int i = 0; i < size(acc_s); ++i) acc_s(i) = float(acc_sh(i));
++        }
+         if constexpr (Is_softcap){
+             FLASH_NAMESPACE::apply_softcap(acc_s, params.softcap);
+         }
+@@ -425,7 +510,8 @@
+         // Reshape rP from (MMA=4, MMA_M, MMA_N) to ((4, 2), MMA_M, MMA_N / 2)
+         // if using m16n8k16 or (4, MMA_M, MMA_N) if using m16n8k8.
+         Tensor tOrP = make_tensor(rP.data(), FLASH_NAMESPACE::convert_layout_acc_Aregs<typename Kernel_traits::TiledMma>(rP.layout()));
+-        FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
++        if constexpr (FA16_PV == 0) { FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V); }
++        else { FLASH_NAMESPACE::pv_gemm<Kernel_traits::kNWarps>(acc_o, tOrP, tOrVt, tOsVt, smem_tiled_copy_V, smem_thr_copy_V, tidx); }
+     }
+ 
+     // Epilogue
+--- a/flash_fwd_launch_template.h
++++ b/flash_fwd_launch_template.h
+@@ -68,7 +68,7 @@
+     BOOL_SWITCH(is_even_MN, IsEvenMNConst, [&] {
+         EVENK_SWITCH(is_even_K, IsEvenKConst, [&] {
+             LOCAL_SWITCH((params.window_size_left >= 0 || params.window_size_right >= 0) && !Is_causal, Is_local, [&] {
+-                BOOL_SWITCH(return_softmax, ReturnSoftmaxConst, [&] {
++                [&] { constexpr bool ReturnSoftmaxConst = false; (void)return_softmax;
+                     ALIBI_SWITCH(params.alibi_slopes_ptr != nullptr, Has_alibi, [&] {
+                         SOFTCAP_SWITCH(params.softcap > 0.0, Is_softcap, [&] {
+                             // Will only return softmax if dropout, to reduce compilation time.
+@@ -92,7 +92,7 @@
+                             C10_CUDA_KERNEL_LAUNCH_CHECK();
+                         });
+                     });
+-                });
++                }();
+             });
+         });
+     });
+@@ -312,11 +312,8 @@
+     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
+         // For A100, we want to run with 128 x 64 (128KB smem).
+         // For H100 we want to run with 64 x 64 (96KB smem) since then we can get 2 CTAs per SM.
+-        if (max_smem_per_block >= 2 * Headdim * (128 + 2 * 64) && max_smem_per_sm < 4 * Headdim * (64 + 2 * 64)) {
+-            run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 8, false, false, T>, Is_dropout, Is_causal>(params, stream);
+-        } else {
+-            run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+-        }
++        // fa16: 5090 (99 KB smem/block) always takes 64 x 64 x 4 warps; the 128-row config is not built.
++        run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+         // 64 KB
+         // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 32, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+         // 96 KB
+--- a/softmax.h
++++ b/softmax.h
+@@ -157,7 +157,7 @@
+                 float scores_scale = exp2f((scores_max_prev(mi) - scores_max_cur) * softmax_scale_log2);
+                 row_sum(mi) *= scores_scale;
+                 #pragma unroll
+-                for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) { acc_o_rowcol(mi, ni) *= scores_scale; }
++                for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) { { using TO = std::remove_reference_t<decltype(acc_o_rowcol(mi, ni))>; acc_o_rowcol(mi, ni) = TO(float(acc_o_rowcol(mi, ni)) * scores_scale); } }
+             }
+             FLASH_NAMESPACE::scale_apply_exp2(scores, row_max, softmax_scale_log2);
+             // We don't do the reduce across threads here since we don't need to use the row_sum.
+@@ -180,7 +180,7 @@
+             lse(mi) = (sum == 0.f || sum != sum) ? (Split ? -INFINITY : INFINITY) : row_max(mi) * softmax_scale + __logf(sum);
+             float scale = !Is_dropout ? inv_sum : inv_sum * rp_dropout;
+             #pragma unroll
+-            for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) { acc_o_rowcol(mi, ni) *= scale; }
++            for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) { { using TO = std::remove_reference_t<decltype(acc_o_rowcol(mi, ni))>; acc_o_rowcol(mi, ni) = TO(float(acc_o_rowcol(mi, ni)) * scale); } }
+         }
+         return lse;
+     };
