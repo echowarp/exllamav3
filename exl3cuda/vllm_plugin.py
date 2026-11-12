@@ -250,18 +250,16 @@ class Exl3LinearMethod(LinearMethodBase):
             segs.append(dict(tr=tr, suh=layer.suh.data[g[0]].contiguous(), svh=layer.svh.data[a:b].contiguous()))
         replaced = _draft_weights_swap(getattr(self, "prefix", None), groups, segs, layer.trellis.device)
         _cap_key = _norm_key(getattr(self, "prefix", "") or "")
-        if isinstance(layer, ParallelLMHead) and os.environ.get("EXL3_DRAFT_VOCAB") and _spec_is_mtp():
-            _build_draft_head(layer, os.environ["EXL3_DRAFT_VOCAB"], cbt)
-            # GRADED-DRAFT: a smaller draft vocab for the deeper draft positions
-            # (EXL3_DRAFT_VOCAB_FAR, from position EXL3_DRAFT_FAR_FROM, 0-based): those passes read fewer head blocks.
-            far = os.environ.get("EXL3_DRAFT_VOCAB_FAR")
-            if far and os.path.realpath(far) == os.path.realpath(os.environ["EXL3_DRAFT_VOCAB"]):
-                layer.exl3_draft_far = layer.exl3_draft      # same vocab: share one copy (~250 MB)
-                logger.info("exl3: far draft vocab = near vocab: one head copy")
-            elif far:
-                _build_draft_head(layer, far, cbt, attr="exl3_draft_far")
+        heads = isinstance(layer, ParallelLMHead) and os.environ.get("EXL3_DRAFT_VOCAB") and _spec_is_mtp()
+        late = None
+        if heads and layer.trellis.is_meta:   # weight keeper meta build: the heads need data, built in whx_finish
+            late = [_whx_reserve() for _ in range(_draft_head_regs())]
+        elif heads:
+            _draft_heads(layer, cbt)
         layer.exl3_id, layer.exl3_n = _register(segs, k, cbt), bounds[-1]
-        if _DYN_ON and isinstance(layer, ParallelLMHead) and getattr(layer, "exl3_draft", None) is not None:
+        if late is not None:
+            _WHX["late"].append((layer, late))
+        elif _DYN_ON and isinstance(layer, ParallelLMHead) and getattr(layer, "exl3_draft", None) is not None:
             _build_draft_dyn(layer)   # DRAFT-DYN + context bias, DYN2 host path (needs layer.exl3_id)
         if _CAP_DIR and _cap_key.startswith("mtp."):
             _CAPTURE[layer.exl3_id] = _cap_key
@@ -354,17 +352,121 @@ def _codebook_tensors(layer):
     return {"mcg": getattr(layer, "mcg", None), "mul1": getattr(layer, "mul1", None)}
 
 
-def _register(segs, k, cbt) -> int:
+def _lins(segs, k, cbt) -> list:
     from exllamav3.modules.quant.exl3 import LinearEXL3
-    lins = [LinearEXL3(None, k, s["svh"].shape[0], suh=s["suh"], svh=s["svh"], trellis=s["tr"],
+    return [LinearEXL3(None, k, s["svh"].shape[0], suh=s["suh"], svh=s["svh"], trellis=s["tr"],
                        mcg=cbt["mcg"], mul1=cbt["mul1"], out_dtype=torch.half) for s in segs]
-    _SEGS.append(lins)
+
+
+def _fuse(i: int):
+    lins = _SEGS[i]
     if FUSE_DECODE and len(lins) > 1:
         try:
-            _FUSED[len(_SEGS) - 1] = _Sliced(lins, FUSE_WIDTH)
+            _FUSED[i] = _Sliced(lins, FUSE_WIDTH)
         except ValueError as e:
             logger.debug("exl3: fused decode not used for this module: %s", e)
+
+
+def _register(segs, k, cbt) -> int:
+    meta = any(s["tr"].is_meta for s in segs)
+    v = _WhxMeta(segs, k, cbt) if meta else _lins(segs, k, cbt)
+    if _WHX["fill"]:                      # whx_finish: a draft head takes the id reserved at its meta build
+        i = _WHX["fill"].pop(0)
+        _SEGS[i] = v
+    else:
+        _SEGS.append(v)
+        i = len(_SEGS) - 1
+    if not meta:
+        _fuse(i)
+    return i
+
+
+# ------------------------------------------------------------------------------------------------
+# Weight keeper hooks (AllBroker weights/vllm/whx_loader.py, EXL3_WHX). The keeper's attach builds the model on the meta
+# device and then puts views of the held VRAM in place of its tensors. Two things here need help for that:
+#   - the EXL3 linears' tensors live in _SEGS (LinearEXL3 objects), not in the model's parameters: whx_registry() hands
+#     them to the keeper by module name, so an export moves them and an attach matches them by path;
+#   - LinearEXL3 (its C++ BC object) and _Sliced (raw data pointers) must be built from real tensors: a meta build
+#     registers _WhxMeta placeholders, and whx_finish() builds them once the held tensors are in place. It also redoes
+#     _Sliced after an export (the export moved the tensors, so the pointer tables were stale) and runs the draft-head /
+#     DRAFT-DYN steps a meta build deferred, at the _SEGS ids reserved for them (the ids are compiled into the graphs).
+# The draft heads are not held: every attach rebuilds them from the held lm_head (or the draft package file).
+_WHX: dict = {"fill": [], "late": []}
+
+
+class _WhxMeta:
+    """_SEGS placeholder of a meta build: one tensor dict per member (tr, suh, svh, mcg / mul1 if present)."""
+
+    def __init__(self, segs, k, cbt):
+        self.k = k
+        self.members = [dict(tr=s["tr"], suh=s["suh"], svh=s["svh"],
+                             **{n: t for n, t in cbt.items() if t is not None}) for s in segs]
+
+
+def _whx_reserve() -> int:
+    _SEGS.append(None)
     return len(_SEGS) - 1
+
+
+def _draft_head_regs() -> int:
+    """How many _register calls _draft_heads makes (whx_finish checks it)."""
+    dw = _draft_weights()
+    if dw is not None and "draft_head.trellis" in dw:
+        return 1                                          # near and far share the draft package's head
+    far = os.environ.get("EXL3_DRAFT_VOCAB_FAR")
+    return 1 + int(bool(far) and os.path.realpath(far) != os.path.realpath(os.environ["EXL3_DRAFT_VOCAB"]))
+
+
+def whx_registry(model) -> dict:
+    """{module name: [{tr, suh, svh[, mcg][, mul1][, bias]} per member]} for every EXL3 linear of the model."""
+    out = {}
+    for name, m in model.named_modules():
+        i = getattr(m, "exl3_id", None)
+        if type(i) is not int or not 0 <= i < len(_SEGS) or _SEGS[i] is None:
+            continue
+        v = _SEGS[i]
+        if isinstance(v, _WhxMeta):
+            out[name] = v.members
+        else:
+            out[name] = [{n: t for n, t in (("tr", l.trellis), ("suh", l.suh), ("svh", l.svh), ("mcg", l.mcg_tensor),
+                                             ("mul1", l.mul1_tensor), ("bias", l.bias)) if t is not None} for l in v]
+    return out
+
+
+def whx_finish(model):
+    mods = list(model.modules())
+    ids = sorted({m.exl3_id for m in mods if type(getattr(m, "exl3_id", None)) is int})
+    built = 0
+    for i in ids:
+        v = _SEGS[i]
+        if isinstance(v, _WhxMeta):
+            if any(t.is_meta for d in v.members for t in d.values()):
+                raise RuntimeError(f"exl3: WHX: linear {i} still has meta tensors")
+            segs = [dict(tr=d["tr"], suh=d["suh"], svh=d["svh"]) for d in v.members]
+            cbt = {"mcg": v.members[0].get("mcg"), "mul1": v.members[0].get("mul1")}
+            _SEGS[i] = _lins(segs, v.k, cbt)
+            built += 1
+        _FUSED.pop(i, None)
+        _fuse(i)
+    mine = {id(m) for m in mods}
+    late = [x for x in _WHX["late"] if id(x[0]) in mine]
+    for item in late:
+        _WHX["late"].remove(item)
+        layer, res = item
+        n0 = len(_SEGS)
+        _WHX["fill"][:] = res
+        try:
+            _draft_heads(layer, _codebook_tensors(layer))   # the held views, not the meta build's tensors
+        finally:
+            left = list(_WHX["fill"])
+            _WHX["fill"].clear()
+        if left or len(_SEGS) != n0:
+            raise RuntimeError(f"exl3: WHX: draft heads used {len(res) - len(left) + len(_SEGS) - n0} linear ids, "
+                               f"{len(res)} reserved")
+        if _DYN_ON and getattr(layer, "exl3_draft", None) is not None:
+            _build_draft_dyn(layer)
+    logger.info("exl3: WHX: %d linears built from held memory, %d fused tables redone, %d lm_head(s) finished",
+                built, sum(1 for i in ids if i in _FUSED), len(late))
 
 
 # FUSED-DECODE: at decode/verify row counts, run a fused module's members (gate+up, q+k+v,
@@ -635,6 +737,18 @@ def _spec_is_mtp():
     except Exception:
         return True
     return sc is not None and "mtp" in str(getattr(sc, "method", "")).lower()
+
+
+def _draft_heads(layer, cbt):
+    _build_draft_head(layer, os.environ["EXL3_DRAFT_VOCAB"], cbt)
+    # GRADED-DRAFT: a smaller draft vocab for the deeper draft positions
+    # (EXL3_DRAFT_VOCAB_FAR, from position EXL3_DRAFT_FAR_FROM, 0-based): those passes read fewer head blocks.
+    far = os.environ.get("EXL3_DRAFT_VOCAB_FAR")
+    if far and os.path.realpath(far) == os.path.realpath(os.environ["EXL3_DRAFT_VOCAB"]):
+        layer.exl3_draft_far = layer.exl3_draft      # same vocab: share one copy (~250 MB)
+        logger.info("exl3: far draft vocab = near vocab: one head copy")
+    elif far:
+        _build_draft_head(layer, far, cbt, attr="exl3_draft_far")
 
 
 def _build_draft_head(layer, path, cbt, attr="exl3_draft"):
