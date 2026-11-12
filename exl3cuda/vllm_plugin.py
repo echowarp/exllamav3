@@ -1482,7 +1482,7 @@ def _patch_int8kv_fa():
                               self.scale, md.max_query_len)
         return True
 
-    def _i4_forward_mixed(self, query, kv_cache, md, output):
+    def _i4_forward_mixed_old(self, query, kv_cache, md, output):
         """int4 prefill / mixed step: long rows through _i4_prefill_fa, the decode / verify rows next to the chunk
         through va4 on a subset (stock int4 Triton if va4 is unavailable)."""
         key_cache, value_cache = self._pth_key_value_caches(kv_cache)
@@ -1545,6 +1545,104 @@ def _patch_int8kv_fa():
             out.index_copy_(0, rows, os_)
         return output
 
+    # I4-PLAN: the mixed-step row plan (FA prefill rows, va4 pseudo-sequences, their device index tensors) is the same
+    # for every attention layer of a step, so it is built once per step on the first layer and reused by the others.
+    # No host sync: the row layout comes from query_start_loc_cpu (exact on the host), decode / chunk seq lens are
+    # gathered on the GPU (md.seq_lens[idx] - offset), and only long prefill rows (no pending drafts, so the CPU upper
+    # bound is exact) use a host int. Index tensors go host->device from pinned memory, non_blocking. vLLM 0.26's
+    # TritonAttentionMetadata has no query_start_loc_cpu / seq_lens_cpu, so the old path fell back to .cpu() on every
+    # layer: 2 DtoH syncs + 4 pageable HtoD copies per layer (~96 per mixed step), which serialized host and GPU.
+    # EXL3_I4PLAN=0 = old path; EXL3_I4PLAN_CHECK=N checks the host seq lens against the device for the first N plans
+    # (one sync each).
+    _I4PLAN = os.environ.get("EXL3_I4PLAN", "1") == "1"
+    _I4PLAN_CHECK = [int(os.environ.get("EXL3_I4PLAN_CHECK", "0"))]
+    _I4PQ = int(os.environ.get("EXL3_VA4_PREFILL_Q", "64"))
+
+    def _pin(vals, dtype, dev):
+        return torch.tensor(vals, dtype=dtype, pin_memory=True).to(dev, non_blocking=True)
+
+    def _i4_plan(md, dev, use_va4):
+        nr = md.query_start_loc.shape[0] - 1
+        qcpu = getattr(md, "_exl3_qsl_cpu", None)
+        qsl = qcpu[: nr + 1].tolist() if qcpu is not None and qcpu.shape[0] >= nr + 1 else md.query_start_loc[: nr + 1].cpu().tolist()
+        ub = getattr(md, "_exl3_sl_ub", None)
+        ubl = ub[:nr].tolist() if ub is not None and ub.shape[0] >= nr else md.seq_lens[:nr].cpu().tolist()
+        if _I4PLAN_CHECK[0] > 0:
+            _I4PLAN_CHECK[0] -= 1
+            real = md.seq_lens[:nr].cpu().tolist()
+            bad = [(i, ubl[i], real[i]) for i in range(nr) if qsl[i + 1] - qsl[i] > VQ and ubl[i] != real[i]]
+            if bad:
+                logger.warning("exl3: I4-PLAN host seq len mismatch on prefill rows %s: syncing for exact values", bad[:4])
+                ubl = real
+        fa, pseudo = [], []
+        for i in range(nr):
+            a, b = qsl[i], qsl[i + 1]
+            n = b - a
+            if n <= 0:
+                continue
+            if n <= VQ and use_va4:
+                pseudo.append((i, a, b, 0))
+            elif n <= _I4PQ and use_va4:
+                for c in range(a, b, 8):
+                    e = min(c + 8, b)
+                    pseudo.append((i, c, e, b - e))
+            elif n > VQ:
+                fa.append((a, b, md.block_table[i].to(torch.int32), ubl[i]))
+            else:
+                pseudo.append((i, a, b, 0))
+        groups = []
+        for g0 in range(0, len(pseudo), _VA_WAVE):
+            grp = pseudo[g0:g0 + _VA_WAVE]
+            rows = [r for _, c, e, _ in grp for r in range(c, e)]
+            lens = [e - c for _, c, e, _ in grp]
+            idx = _pin([i for i, _, _, _ in grp], torch.long, dev)
+            offs = _pin([o for _, _, _, o in grp], md.seq_lens.dtype, dev)
+            groups.append({"rows": _pin(rows, torch.long, dev), "n": len(grp), "maxlen": max(lens),
+                           "cu": _pin([0] + list(itertools.accumulate(lens)), torch.int32, dev),
+                           "sls": (md.seq_lens.index_select(0, idx) - offs).to(torch.int32),
+                           "bt": md.block_table.index_select(0, idx),
+                           "maxL": max(ubl[i] - o for i, _, _, o in grp)})
+        return {"fa": fa, "groups": groups}
+
+    def _i4_forward_mixed(self, query, kv_cache, md, output):
+        """int4 prefill / mixed step: long rows through _i4_prefill_fa, the decode / verify rows next to the chunk
+        through va4 on a subset (stock int4 Triton if va4 is unavailable). Plan built once per step (I4-PLAN)."""
+        if not _I4PLAN:
+            return _i4_forward_mixed_old(self, query, kv_cache, md, output)
+        key_cache, value_cache = self._pth_key_value_caches(kv_cache)
+        T = md.num_actual_tokens
+        H = self.num_heads
+        q = query[:T].view(-1, H, 256)
+        out = output[:T].view(-1, H, 256)
+        use_va4 = _VA4 and _va_ready(q.device) and bool(_VA_ST.get("va4"))
+        plan = getattr(md, "_exl3_i4plan", None)
+        if plan is None or plan.get("va4") != use_va4:
+            plan = _i4_plan(md, q.device, use_va4); plan["va4"] = use_va4
+            try:
+                md._exl3_i4plan = plan
+            except Exception:  # noqa
+                pass
+        for a, b, pages, L in plan["fa"]:
+            _i4_prefill_fa(q[a:b], key_cache, value_cache, pages, L, float(self.scale), out[a:b])
+        for g in plan["groups"]:
+            qs = q.index_select(0, g["rows"]).contiguous()
+            os_ = torch.empty_like(qs)
+            if use_va4:
+                getattr(torch.ops, os.environ.get("EXL3_VA4_OP", "va4b")).forward(
+                    qs, key_cache, key_cache.stride(0), key_cache.stride(2), key_cache.stride(1), g["bt"], g["sls"],
+                    g["cu"], os_, _VA_ST["po"], _VA_ST["pm"], _VA_ST["pl"], _VA_ST["signs"], _VA_ST["qr"],
+                    max(1, _VA_WAVE // g["n"]), key_cache.shape[1], self.scale, g["maxlen"])
+            else:
+                unified_attention(q=qs, k=key_cache, v=value_cache, out=os_, cu_seqlens_q=g["cu"], max_seqlen_q=g["maxlen"],
+                                  seqused_k=g["sls"], max_seqlen_k=g["maxL"],
+                                  softmax_scale=self.scale, causal=True, alibi_slopes=None, window_size=(-1, -1),
+                                  block_table=g["bt"], softcap=self.logits_soft_cap,
+                                  q_descale=None, k_descale=None, v_descale=None,
+                                  kv_quant_mode=self._kv_quant_mode,
+                                  k_scale_cache=self._k_scale_cache, v_scale_cache=self._v_scale_cache, **_mix3d(md))
+            out.index_copy_(0, g["rows"], os_)
+        return output
+
     def forward(self, layer, query, key, value, kv_cache, attn_metadata, output, output_scale=None,
                 output_block_scale=None):
         md = attn_metadata
@@ -1605,6 +1703,24 @@ def _patch_int8kv_fa():
         return output
 
     TritonAttentionImpl.forward = forward
+    try:
+        from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadataBuilder
+        _ob = TritonAttentionMetadataBuilder.build
+
+        def _build(self, common_prefix_len, common_attn_metadata, fast_build=False):
+            md = _ob(self, common_prefix_len, common_attn_metadata, fast_build)
+            try:
+                md._exl3_qsl_cpu = common_attn_metadata.query_start_loc_cpu
+                md._exl3_sl_ub = (common_attn_metadata._seq_lens_cpu if common_attn_metadata._seq_lens_cpu is not None
+                                  else common_attn_metadata.seq_lens_cpu_upper_bound)
+                md._exl3_i4plan = None
+            except Exception:  # noqa
+                pass
+            return md
+        TritonAttentionMetadataBuilder.build = _build
+        logger.info("exl3: I4-PLAN %s (mixed-step attention plan once per step, no host sync)", "on" if _I4PLAN else "off")
+    except Exception as e:  # noqa
+        logger.warning("exl3: I4-PLAN builder hook not installed (%s)", e)
     TritonAttentionImpl._exl3_fa_patched = True
     logger.info("exl3: int8 KV prefill via block-dequantized FA2 (blocks of %d tokens)", _FA_KB)
 

@@ -80,6 +80,8 @@ Production = the Qwen3.8-27B RTX 5090 service (int4_per_token_head KV, MTP k = 7
 | `EXL3_VA4_OP` | va4c | VA4 op namespace (code default `va4b`: set `va4c` for the kernel in csrc/va4) |
 | `EXL3_VA4_PREFILL_Q` | default (64) | VA4-PSEUDO: prefills up to this many rows go through VA4 as 8-row pseudo-sequences |
 | `EXL3_I4FA` | default (1) | I4FA: int4 KV prefill = gather-dequant + rotated q + the same FA2 / FA16 calls |
+| `EXL3_I4PLAN` | default (1) | I4-PLAN: int4 mixed steps (prefill + decode rows) build the attention row plan once per step from the host copies of query_start_loc / seq lens (attached by a TritonAttentionMetadataBuilder.build hook) instead of 2 DtoH syncs + 4 HtoD copies on every attention layer; 0 = old per-layer path |
+| `EXL3_I4PLAN_CHECK` | default (0) | I4-PLAN diagnosis: compare the host seq lens with the device for the first N plans (one sync each) and fall back to the device values on a mismatch |
 | `EXL3_KVW4` | default (1) | KVW4: fused int4 KV-cache write |
 | `EXL3_KVW4_SO` | default (`<package>/lib/kvw4.so`) | KVW4 library |
 | `EXL3_KSMOOTH_INT4` | default (1) | KS4: K smoothing applied to int4 KV too |
