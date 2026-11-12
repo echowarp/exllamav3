@@ -1927,4 +1927,11 @@ def register():
     _patch_kvw4()
     if os.environ.get("EXL3_DRAFT_VOCAB"):
         _patch_mtp_draft_logits()
+    if os.environ.get("EXL3_TAIL_FUSE", "0") not in ("", "0"):   # TAIL-FUSE (tail_fuse.py)
+        try:
+            import sys
+            from . import tail_fuse
+            tail_fuse.install(sys.modules[__name__])
+        except Exception as e:  # noqa: never block engine start; the stock paths stay in place
+            logger.warning("exl3: TAIL-FUSE not active (%s: %s)", type(e).__name__, e)
     return None

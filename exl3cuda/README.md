@@ -28,6 +28,7 @@ stock path in place. Some features need companion patches to vLLM itself (noted 
 | `csrc/va4/`, `csrc/kvw4/` | VA4 verify attention and KVW4 KV write (int4 KV) |
 | `gdn_port.py`, `gdn_fast.py`, `csrc/gdnchunk/` | GDN prefill via the Magnitude kernel; fast GDN decode metadata |
 | `draftdyn.py`, `tools/quantize_draft.py` | DRAFT-DYN pieces; draft-head re-quantization tool |
+| `tail_fuse.py` | TAIL-FUSE decode tail fusions |
 
 Built kernels go to `exl3cuda/lib/` (ignored by git, installed as package data).
 
@@ -94,6 +95,8 @@ Production = the Qwen3.8-27B RTX 5090 service (int4_per_token_head KV, MTP k = 7
 | `EXL3_DRAFT_DYN_GS / _BG / _DELAY_US` | default (64 / 1 / 2000) | DRAFT-DYN host int4 group size, background uploads, upload delay |
 | `EXL3_DRAFT_WINDOW` | unset | DRAFT-WINDOW: sliding window for the MTP layer's attention (drafts only) |
 | `EXL3_CAPTURE_MTP_H / _EVERY` | unset | capture X^T X of the MTP linears' inputs for calibrated draft re-quantization (eager engine) |
+| `EXL3_TAIL_FUSE` | 1 | TAIL-FUSE: bit-exact trimming of the decode small-kernel tail; 1 = all parts or a list of cat, scratch, conv, ks, dlog |
+| `EXL3_TAIL_CONV_BN / _WARPS` | default (auto) | TAIL-FUSE conv tiling |
 
 ## Building the kernels
 
