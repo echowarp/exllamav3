@@ -210,7 +210,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("indices"), py::arg("weights"), py::arg("K"), py::arg("force_shape_idx"), py::arg("mcg"),
           py::arg("mul1"), py::arg("min_index"), py::arg("max_index"), py::arg("force_num_sms"),
           py::arg("num_tokens") = 1, py::arg("size_n_list") = py::none(), py::arg("c_ptrs") = py::none(),
-          py::arg("n_stride_list") = py::none(), py::arg("had_src_list") = py::none(), py::arg("num_had_src") = 0);
+          py::arg("n_stride_list") = py::none(), py::arg("had_src_list") = py::none(), py::arg("num_had_src") = 0,
+          py::arg("c_row_stride") = 0, py::arg("c_base") = 0);
     m.def("hgemm", &hgemm, "hgemm");
     m.def("hgemm_batched", &hgemm_batched, "hgemm_batched");
     m.def("hgemm_recon", &hgemm_recon, "hgemm_recon");

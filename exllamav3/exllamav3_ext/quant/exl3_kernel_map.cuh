@@ -73,7 +73,9 @@ void exl3_gemm_check_smem(int shape_idx, int bits, bool half_k, const char* who)
     void** __restrict__ C_list, \
     const int* __restrict__ n_stride_list, \
     const int* __restrict__ had_src_list, \
-    const int num_had_src
+    const int num_had_src, \
+    const int c_row_stride, \
+    const int64_t c_base
 
 typedef void (*fp_exl3_gemm_kernel) (EXL3_GEMM_ARGS);
 typedef void (*fp_exl3_mgemm_kernel) (EXL3_MGEMM_ARGS);

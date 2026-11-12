@@ -504,7 +504,9 @@ int exl3_mgemm_gr
     const c10::optional<at::Tensor>& c_ptrs,
     const c10::optional<at::Tensor>& n_stride_list,
     const c10::optional<at::Tensor>& had_src_list,
-    int num_had_src
+    int num_had_src,
+    int c_row_stride,
+    int64_t c_base
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(A.device());
@@ -730,7 +732,9 @@ int exl3_mgemm_gr
         (void*)& c_list_ptr,
         (void*)& n_stride_list_ptr,
         (void*)& had_src_list_ptr,
-        (void*)& num_had_src
+        (void*)& num_had_src,
+        (void*)& c_row_stride,
+        (void*)& c_base
     };
 
     auto add_graph_args = [&](void* kernel_ptr)
@@ -861,7 +865,9 @@ int exl3_mgemm
     const c10::optional<at::Tensor>& c_ptrs,
     const c10::optional<at::Tensor>& n_stride_list,
     const c10::optional<at::Tensor>& had_src_list,
-    int num_had_src
+    int num_had_src,
+    int c_row_stride,
+    int64_t c_base
 )
 {
     return exl3_mgemm_gr
@@ -887,6 +893,8 @@ int exl3_mgemm
         c_ptrs,
         n_stride_list,
         had_src_list,
-        num_had_src
+        num_had_src,
+        c_row_stride,
+        c_base
     );
 }

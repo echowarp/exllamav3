@@ -232,11 +232,13 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
         int n_j = (size_n_list && mat_index >= 0) ? size_n_list[mat_index] : size_n;
         // Column slices write into a wider row (their source matrix's full width)
         int n_stride_j = (n_stride_list && mat_index >= 0) ? n_stride_list[mat_index] : n_j;
+        // C may have its own row stride (all slices writing one concatenated row)
+        int c_stride_j = c_row_stride ? c_row_stride : n_stride_j;
         int size_m_ = size_m;
         // Idle z-slots past bszm carry mat_index -1 and never touch A_; guard the table read anyway
         half* A_ = A_had + ((had_src_list && mat_index >= 0) ? had_src_list[mat_index] : j) * size_m * size_k;
         void* C_;
-        if (C_list && mat_index >= 0) C_ = C_list[mat_index];
+        if (C_list && mat_index >= 0) C_ = (void*) (((char*) C_list[mat_index]) + c_base);   // c_base: byte offset into each output (0 = absolute table)
         else if constexpr (c_fp32) C_ = (void*) (((float*) C) + j * size_m * size_n);
         else                       C_ = (void*) (((half*) C) + j * size_m * size_n);
         void* C_base = C_;
@@ -249,12 +251,12 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
 
                 exl3_gemm_kernel_inner
                 <bits, half_k, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, false>
-                (A_, B, C_, MIN(size_m_, TILESIZE_M), size_k, n_j, locks + lock_offs, nullptr, n_stride_j);
+                (A_, B, C_, MIN(size_m_, TILESIZE_M), size_k, n_j, locks + lock_offs, nullptr, n_stride_j, c_stride_j);
             }
 
             A_ += TILESIZE_M * size_k;
-            if constexpr (c_fp32) C_ = (void*) (((float*) C_) + TILESIZE_M * n_stride_j);
-            else                  C_ = (void*) (((half*) C_) + TILESIZE_M * n_stride_j);
+            if constexpr (c_fp32) C_ = (void*) (((float*) C_) + TILESIZE_M * c_stride_j);
+            else                  C_ = (void*) (((half*) C_) + TILESIZE_M * c_stride_j);
             size_m_ -= TILESIZE_M;
 
             #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ > 890)) || defined(USE_ROCM)
@@ -283,7 +285,7 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
             {
                 int row = this_warp / cols;
                 int col = this_warp - row * cols;
-                int offs = row * n_stride_j + col * 128;
+                int offs = row * c_stride_j + col * 128;
                 if constexpr (c_fp32)
                     had_ff_r_128_inner<false, true>
                     (

@@ -57,7 +57,9 @@ int exl3_mgemm_gr
     // source matrix index (suh and A_had are then per source), and the number of sources
     const c10::optional<at::Tensor>& n_stride_list = {},
     const c10::optional<at::Tensor>& had_src_list = {},
-    int num_had_src = 0
+    int num_had_src = 0,
+    int c_row_stride = 0,      // C row stride override (0 = per-slice n_stride)
+    int64_t c_base = 0         // added (bytes) to every c_ptrs entry
 );
 
 int exl3_mgemm
@@ -82,5 +84,7 @@ int exl3_mgemm
     const c10::optional<at::Tensor>& c_ptrs = {},
     const c10::optional<at::Tensor>& n_stride_list = {},
     const c10::optional<at::Tensor>& had_src_list = {},
-    int num_had_src = 0
+    int num_had_src = 0,
+    int c_row_stride = 0,      // C row stride override (0 = per-slice n_stride)
+    int64_t c_base = 0         // added (bytes) to every c_ptrs entry
 );
