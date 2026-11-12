@@ -18,5 +18,15 @@ stock path in place. Some features need companion patches to vLLM itself (noted 
 | Path (under `exl3cuda/`) | What |
 |---|---|
 | `__init__.py`, `pyproject.toml` | package; `pip install ./exl3cuda` (registers the vLLM plugin entry point) |
+| `int8_kernels.py`, `fused_kernels.py` | Triton int8 (W8A8) prefill GEMM pieces; fused trellis -> int8 decode (L2 split) |
 
 Built kernels go to `exl3cuda/lib/` (ignored by git, installed as package data).
+
+## Environment variables
+
+Production = the Qwen3.8-27B RTX 5090 service (int4_per_token_head KV, MTP k = 7); "default (x)" = not set, code default x.
+
+| Variable | Production | What it does |
+|---|---|---|
+| `EXL3_INT8_FUSED_MAX_M` | default (512) | fused_kernels.fused_linear: F1 (fused decode + GEMM) up to this many rows, F2 above |
+| `EXL3_INT8_FUSED_ASM` | default (1) | fused_kernels: inline-PTX decode (0 = pure-Triton spelling, same bits) |
