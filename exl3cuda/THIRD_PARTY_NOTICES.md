@@ -105,3 +105,12 @@ CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
 OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
+
+## Magnitude (Apache-2.0)
+
+`csrc/gdnchunk/gdn_chunk.cu` is a modified port of Magnitude's `gated_delta_chunk` CUDA kernel and
+`csrc/gdnchunk/magnitude/{cuda_prelude.cuh, element.cuh}` are unmodified copies, from
+https://github.com/magnitudedev/magnitude (commit 7f029060a37ed1f7884db038222dc8f36430a08e).
+Copyright 2026 Magnitude AI Inc., licensed under the Apache License, Version 2.0: full text in
+`csrc/gdnchunk/magnitude/LICENSE`, attribution in `csrc/gdnchunk/magnitude/NOTICE`; the modifications are listed in the
+header of `gdn_chunk.cu`.

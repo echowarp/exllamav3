@@ -1,0 +1,10 @@
+Files in this directory (cuda_prelude.cuh, element.cuh) are unmodified copies from
+Magnitude (https://github.com/magnitudedev/magnitude, commit 7f029060a37ed1f7884db038222dc8f36430a08e):
+  inference/seismic/runtime/src/native/cuda_prelude.cuh
+  inference/seismic/lang/native-library/cuda/element.cuh
+Copyright 2026 Magnitude AI Inc. Licensed under the Apache License, Version 2.0 (see LICENSE in this directory).
+
+../gdn_chunk.cu is a modified port of Magnitude's
+  inference/engine/kernels/kernels/cuda/gated_delta_chunk.cu
+  inference/engine/kernels/kernels/cuda/lib/recurrent/recurrent.cuh
+(same copyright and license); the modifications are listed in its header.

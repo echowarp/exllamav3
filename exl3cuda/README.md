@@ -26,6 +26,7 @@ stock path in place. Some features need companion patches to vLLM itself (noted 
 | `csrc/fa16/` | FA16 FlashAttention 2 variant (patch + binding + build) |
 | `csrc/va/` | VA verify attention kernel (int8 KV) |
 | `csrc/va4/`, `csrc/kvw4/` | VA4 verify attention and KVW4 KV write (int4 KV) |
+| `gdn_port.py`, `gdn_fast.py`, `csrc/gdnchunk/` | GDN prefill via the Magnitude kernel; fast GDN decode metadata |
 
 Built kernels go to `exl3cuda/lib/` (ignored by git, installed as package data).
 
@@ -79,6 +80,10 @@ Production = the Qwen3.8-27B RTX 5090 service (int4_per_token_head KV, MTP k = 7
 | `EXL3_KVW4` | default (1) | KVW4: fused int4 KV-cache write |
 | `EXL3_KVW4_SO` | default (`<package>/lib/kvw4.so`) | KVW4 library |
 | `EXL3_KSMOOTH_INT4` | default (1) | KS4: K smoothing applied to int4 KV too |
+| `EXL3_GDN_PORT` | 1 | GDN-PORT: GDN prefill through the Magnitude WY kernel (csrc/gdnchunk) instead of FLA |
+| `EXL3_GDN_PORT_SO` | default (`<package>/lib/gdn_chunk_mag.so`) | GDN-PORT extension |
+| `EXL3_GDN_PORT_ROWS` | default (64) | GDN-PORT scan tile |
+| `EXL3_GDN_FAST` | 1 | GDN-FAST: one Triton launch for the decode-step GDN metadata (2 = check every field against the original) |
 
 ## Building the kernels
 
@@ -113,6 +118,12 @@ One nvcc needs ~12 GB RAM (`MAX_JOBS=1`); `build-seq.sh fa_f:1:2 fa_b:1:0` build
 
     python3 exl3cuda/csrc/va4/build.py       # -> lib/va4c.so (torch.ops.va4c); extra nvcc flags are passed through
     python3 exl3cuda/csrc/kvw4/build.py      # -> lib/kvw4.so (torch.ops.kvw4)
+
+### GDN chunk (`csrc/gdnchunk`)
+
+    python3 exl3cuda/csrc/gdnchunk/build.py  # -> lib/gdn_chunk_mag.so (no GPU needed)
+
+See `csrc/gdnchunk/README.md` for the kernel, its argument contract and measurements.
 
 ## Data files you supply
 

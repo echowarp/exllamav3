@@ -1217,6 +1217,8 @@ def _rc_forward(self, orig_core, md, md_all, mixed_qkv, b, a, core_attn_out):
         md2 = dataclasses.replace(md, spec_sequence_masks=None, num_spec_decodes=0, num_spec_decode_tokens=0,
                                   spec_query_start_loc=None, spec_state_indices_tensor=None, spec_token_indx=None,
                                   non_spec_token_indx=None, num_accepted_tokens=None, num_actual_tokens=nT)
+        if getattr(md, "_llmt_port", None) is not None:   # GDN-PORT index tensors (gdn_port.py) survive the copy
+            object.__setattr__(md2, "_llmt_port", md._llmt_port)
         if sliced:   # RC-SLICE: views, output written in place
             out2 = core_attn_out[ts:nact]
             out2.zero_()
@@ -1416,6 +1418,12 @@ def register():
             logger.warning("exl3: WHX not active (%s: %s)", type(e).__name__, e)
     _patch_block_align()
     _patch_ksmooth()
+    if os.environ.get("EXL3_GDN_PORT", "0") == "1":   # before GDN-RC: its wrapper must call the port-aware core
+        try:
+            from . import gdn_port
+            gdn_port.install()
+        except Exception as e:  # noqa: never block engine start; vLLM's GDN prefill stays in place
+            logger.warning("exl3: GDN-PORT not active (%s: %s)", type(e).__name__, e)
     _patch_gdn_recompute()
     _patch_int8kv_fa()
     _patch_kvw4()
