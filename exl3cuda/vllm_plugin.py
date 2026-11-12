@@ -757,9 +757,84 @@ def _patch_int8kv_fa():
     # prompt-lookup draft verifies 1 + 23 rows: EXL3_VERIFY_Q=24, else its CUDA-graph capture would take the prefill path.
     VQ = int(os.environ.get("EXL3_VERIFY_Q", "8"))
 
+    # VA (long-context decode): verify / decode attention (<= 8 query rows per sequence) on the custom CUDA kernel
+    # csrc/va/va_kernel.cu (FlashDecoding split over the context, 42 CTA-segments per KV head and sequence = one wave on
+    # 170 SMs; kernel benchmark 1.9x Triton at 64-131k, error = Triton's).
+    # Pure torch.ops launch with fixed shapes: CUDA-graph safe (persistent scratch, padded sequences have seq_len 0).
+    # EXL3_VA=1 on; EXL3_VA_SO = library; anything unexpected -> the original Triton path (logged once).
+    _VA = os.environ.get("EXL3_VA", "0") == "1"
+    _VA_WAVE = int(os.environ.get("EXL3_VA_WAVE", "42"))
+    _VA_ST = {}
+
+    def _va_ready(dev):
+        if "ok" not in _VA_ST:
+            try:
+                torch.ops.load_library(os.environ.get("EXL3_VA_SO", os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib", "va5090.so")))
+                n = _VA_WAVE * 4 * 48
+                _VA_ST["po"] = torch.empty(n * 256, dtype=torch.float32, device=dev)
+                _VA_ST["pm"] = torch.empty(n, dtype=torch.float32, device=dev)
+                _VA_ST["pl"] = torch.empty(n, dtype=torch.float32, device=dev)
+                _VA_ST["ok"] = True
+                logger.info("exl3: VA on: custom verify attention (%d CTA-segments per KV head, scratch %.1f MiB)",
+                            _VA_WAVE, n * 258 * 4 / 2**20)
+            except Exception as e:  # noqa: BLE001
+                _VA_ST["ok"] = False
+                logger.warning("exl3: VA not available (%r): Triton verify attention", e)
+        return _VA_ST["ok"]
+
+    def _va_try(self, query, kv_cache, md, output):
+        if (md.max_query_len > 8 or self.num_heads != 24 or self.num_kv_heads != 4 or self.head_size != 256
+                or not getattr(self, "_is_per_token_head_quant", False)
+                or self._kv_quant_mode != KVQuantMode.INT8_PER_TOKEN_HEAD
+                or self.alibi_slopes is not None or self.sinks is not None
+                or self.sliding_window not in (None, (-1, -1)) or (self.logits_soft_cap or 0) != 0
+                or not getattr(md, "causal", True) or getattr(md, "mm_prefix_range_tensor", None) is not None
+                or query.dtype != torch.float16):
+            return False
+        nseq = md.seq_lens.shape[0]
+        if nseq > _VA_WAVE or not _va_ready(query.device):
+            return False
+        key_cache, value_cache = self._pth_key_value_caches(kv_cache)
+        kk = key_cache.data_ptr()
+        lay = _VA_ST.setdefault("lay", {})
+        ok = lay.get(kk)
+        if ok is None:
+            ks, vs = self._k_scale_cache, self._v_scale_cache
+            ok = (key_cache.dtype == torch.int8 and key_cache.stride(3) == 1 and key_cache.stride(1) % 8 == 0
+                  and value_cache.data_ptr() == kk + 260 and ks is not None and vs is not None
+                  and ks.data_ptr() == kk + 256 and vs.data_ptr() == kk + 516
+                  and key_cache.stride(0) % 8 == 0 and key_cache.stride(2) % 8 == 0)
+            lay[kk] = ok
+            if not ok:
+                logger.warning("exl3: VA: unexpected KV layout (strides %s): Triton verify attention",
+                               tuple(key_cache.stride()))
+        if not ok:
+            return False
+        T = md.num_actual_tokens
+        q = query[:T].view(-1, self.num_heads, 256)
+        out = output[:T].view(-1, self.num_heads, 256)
+        if not (q.stride(2) == 1 and out.stride(2) == 1 and q.stride(0) % 4 == 0 and q.stride(1) % 4 == 0):
+            if not _VA_ST.get("warned_stride"):
+                _VA_ST["warned_stride"] = True
+                logger.warning("exl3: VA: query/output strides %s / %s not supported: Triton", tuple(q.stride()),
+                               tuple(out.stride()))
+            return False
+        _VA_ST["n"] = _VA_ST.get("n", 0) + 1
+        if _VA_ST["n"] in (1, 1000):
+            logger.info("exl3: VA dispatch #%d (q strides %s, capturing %s)", _VA_ST["n"], tuple(q.stride()),
+                        torch.cuda.is_current_stream_capturing())
+        torch.ops.va5090.forward(q, key_cache, key_cache.stride(0), key_cache.stride(2), key_cache.stride(1),
+                                 md.block_table, md.seq_lens,
+                                 md.query_start_loc, out, _VA_ST["po"], _VA_ST["pm"], _VA_ST["pl"],
+                                 max(1, _VA_WAVE // nseq), key_cache.shape[1], self.scale, md.max_query_len)
+        return True
+
     def forward(self, layer, query, key, value, kv_cache, attn_metadata, output, output_scale=None,
                 output_block_scale=None):
         md = attn_metadata
+        if (_VA and md is not None and md.max_query_len <= VQ and output_scale is None and output_block_scale is None
+                and _va_try(self, query, kv_cache, md, output)):
+            return output
         if (md is None or md.max_query_len <= VQ or not getattr(self, "_is_per_token_head_quant", False)
                 or self._kv_quant_mode != KVQuantMode.INT8_PER_TOKEN_HEAD or self.head_size != 256
                 or output_scale is not None or output_block_scale is not None or self.alibi_slopes is not None

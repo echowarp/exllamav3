@@ -24,6 +24,7 @@ stock path in place. Some features need companion patches to vLLM itself (noted 
 | `gdn_rc.py` | Triton GDN recompute kernels |
 | `i8fa_prefill.py`, `csrc/i8fa/` | I8FA int8-KV prefill helpers and kernels |
 | `csrc/fa16/` | FA16 FlashAttention 2 variant (patch + binding + build) |
+| `csrc/va/` | VA verify attention kernel (int8 KV) |
 
 Built kernels go to `exl3cuda/lib/` (ignored by git, installed as package data).
 
@@ -66,6 +67,9 @@ Production = the Qwen3.8-27B RTX 5090 service (int4_per_token_head KV, MTP k = 7
 | `EXL3_I8FA` | 1 | I8FA: CUDA gather-dequant + LSE merge around the same FA2 calls (bitwise equal), paged in-kernel-dequant FA2 for few rows |
 | `EXL3_I8FA_DIR` | default (`<package>/lib`) | directory with `i8kv/`, `i8fa_fp/`, `i8fa_a/` |
 | `EXL3_I8FA_PAGED_MAXQ` | auto | paged route: auto = Q <= 128 and >= 3 parts, N = Q <= N, 0 = off |
+| `EXL3_VA` | 1 | VA: custom CUDA verify / decode attention (<= 8 query rows) for int8 KV; also enables VA4 |
+| `EXL3_VA_SO` | default (`<package>/lib/va5090.so`) | VA library |
+| `EXL3_VA_WAVE` | default (42) | VA CTA-segments per KV head and sequence (one wave on 170 SMs) |
 
 ## Building the kernels
 
@@ -91,6 +95,10 @@ One nvcc needs ~12 GB RAM (`MAX_JOBS=1`); `build-seq.sh fa_f:1:2 fa_b:1:0` build
     python3 build.py i8kv            # gather-dequant + merge -> lib/i8kv/i8kv.so
     python3 build.py i8fa_fp 1 2     # paged FA2, FA16 f numerics (needs ../fa16/fetch_and_patch.sh first)
     python3 build.py i8fa_a 0 0      # paged FA2, stock numerics (used when EXL3_FA16 is unset)
+
+### VA (`csrc/va`)
+
+    python3 exl3cuda/csrc/va/build.py        # -> lib/va5090.so (torch.ops.va5090)
 
 ## Data files you supply
 
