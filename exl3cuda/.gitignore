@@ -1,0 +1,7 @@
+# built kernels and build trees
+lib/
+csrc/*/build/
+csrc/*/build-*.log
+# fetched by csrc/fa16/fetch_and_patch.sh
+csrc/fa16/fa/
+csrc/fa16/srcmod/

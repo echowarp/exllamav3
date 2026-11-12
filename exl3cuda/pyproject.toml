@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "exl3cuda"
+version = "0.1.0"
+description = "EXL3 (exllamav3) quantized models in vLLM on NVIDIA CUDA (RTX 5090): plugin, kernels, engine patches"
+readme = "README.md"
+requires-python = ">=3.10"
+
+[tool.setuptools]
+packages = ["exl3cuda"]
+package-dir = { "exl3cuda" = "." }
+
+[tool.setuptools.package-data]
+exl3cuda = ["lib/*.so", "lib/*/*.so"]
