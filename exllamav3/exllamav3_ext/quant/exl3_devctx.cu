@@ -97,6 +97,7 @@ int* DevCtx::get_locks(int device)
 #else
         size_t size = (MAX_TILES_C + MAX_BARRIERS * 2 + MOE_SCHED_INTS) * sizeof(int);
 #endif
+        size += EXL3_GV3_SCRATCH_FLOATS * sizeof(float) + 256;   // gemv3 scratch (get_gv3_scratch)
         cudaError_t e = cudaMalloc(&locks[device], size);
         TORCH_CHECK(e == cudaSuccess, "exl3 lock buffer allocation failed on device ", device, ": ", cudaGetErrorString(e));
         e = cudaMemset(locks[device], 0, size);
@@ -118,6 +119,19 @@ int g_get_num_sms(int device)
 int g_get_smem_max(int device)
 {
     return DevCtx::instance().get_smem_max(device);
+}
+
+float* DevCtx::get_gv3_scratch(int device)
+{
+    int* l = get_locks(device);
+#if defined(USE_ROCM)
+    size_t ints = MAX_TILES_C + MAX_BARRIERS * 2 + MOE_SCHED_INTS + EXL3_GRID_BARRIER_INTS;
+#else
+    size_t ints = MAX_TILES_C + MAX_BARRIERS * 2 + MOE_SCHED_INTS;
+#endif
+    uintptr_t p = (uintptr_t) (l + ints);
+    p = (p + 255) & ~(uintptr_t) 255;
+    return (float*) p;
 }
 
 void prepare_ctx(int device)

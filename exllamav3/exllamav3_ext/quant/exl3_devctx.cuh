@@ -8,6 +8,8 @@
 #define MAX_TILES_C (1024 * 1024)
 #define MAX_BARRIERS 1024
 #define BARRIER_LOCKS_OFFSET MAX_TILES_C
+// gemv3 scratch, 16 k-chunks x 8 rows x 5120 columns (down_proj at m = 8)
+#define EXL3_GV3_SCRATCH_FLOATS (16 * 8 * 5120)
 
 // MoE expert scheduler state, after the barrier counters: [0] next ticket, [1] retired groups,
 // [2 + group] ticket published to group. Self-resetting, zero-initialized with the rest of the buffer
@@ -54,6 +56,8 @@ public:
     int get_smem_request(int device);
     void* get_ws(int device);
     int* get_locks(int device);
+    // gemv3 cross-chunk scratch (exl3_gemv_kernel_t), EXL3_GV3_SCRATCH_FLOATS fp32 behind the lock ints
+    float* get_gv3_scratch(int device);
 
 private:
     DevCtx() = default;

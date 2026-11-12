@@ -8,6 +8,7 @@ namespace cg = cooperative_groups;
 #include "../util.h"
 #include "../util.cuh"
 #include "exl3_gemv_kernel.cuh"
+#include "exl3_gemv_kernel_t.cuh"   // gemv3 route for down_proj at m = 8
 #include "exl3_devctx.cuh"
 #include <map>
 
@@ -25,6 +26,14 @@ large-n/small-k FFN sizes. Big-k x big-n shapes lose slightly and fall through t
 kernel, as do other architectures (Ada/Blackwell are memory-bound here and keep the regular
 kernel), bpw != 4, and m > 8.
 */
+
+// EXL3_GEMV3 = 0 disables the gemv3 route (exl3_gemv_kernel_t, bitwise identical to the
+// narrow config of exl3_gemv_kernel; transposed block mapping, 36.6 vs 40.5 us at 17408 x 5120, m = 8, RTX 5090)
+static bool exl3_gemv3_enabled()
+{
+    static const bool on = [] { const char* e = std::getenv("EXL3_GEMV3"); return !e || atoi(e) != 0; }();
+    return on;
+}
 
 static int exl3_gemv_env_mode()
 {
@@ -158,6 +167,28 @@ bool exl3_gemv_try_launch
     // between the two in bytes; unmeasured, so it inherits the K + 1 envelope)
     int cfg = exl3_gemv_cfg(cc, size_m, size_k, size_n, half_k ? K + 1 : K, cb, mode, narrow_coresident);
     if (cfg < 0) return false;
+
+    // gemv3 route: only the measured win (down_proj shape, 17408 -> 5120, m = 8, 4 bpw mul1, fp16 out, narrow config).
+    // The scratch replaces the locks argument (unused by the GEMV kernels); grid as many blocks as fit, the kernel
+    // strides over (k-chunk, column-block) items
+    if (cfg == 0 && !smem && !half_k && K == 4 && cb == 2 && !c_fp32 && size_m == 8 && size_k == 17408 && size_n == 5120
+        && 16 * 8 * size_n <= EXL3_GV3_SCRATCH_FLOATS && exl3_gemv3_enabled())
+    {
+        void* k3 = (void*) exl3_gemv_kernel_t<4, false, 2, 1, 0>;
+        int occ3 = occupancy(k3, 512);
+        int items = CEIL_DIVIDE(size_n / 32, 16) * 16;
+        int grid3 = MIN(items, occ3 * num_sms);
+        if (grid3 >= 1)
+        {
+            float* scratch = DevCtx::instance().get_gv3_scratch(device);
+            void* args3[10];
+            for (int i = 0; i < 10; ++i) args3[i] = kernel_args[i];
+            args3[6] = (void*) &scratch;
+            cuda_check(cudaLaunchCooperativeKernel(k3, dim3(grid3), dim3(512), args3, 0, stream));
+            if (launched_kernel) *launched_kernel = k3;
+            return true;
+        }
+    }
 
     void* kernel = cfg == 0 ? narrow_kernel : select(cfg);
     if (!kernel) return false;
