@@ -217,9 +217,87 @@ def dequant_rows_fp16(packed: torch.Tensor, scales: torch.Tensor, zeros: torch.T
     return out
 
 
+# Fused draft row. Without it, every DRAFT-DYN draft pass skips TAIL-FUSE's one-kernel row write and runs ~8 small
+# ops (~0.23 ms of host time each on a Xeon E5 host). Fast path: TAIL-FUSE's draft_scatter for the static row
+# (bit-identical) plus one Triton kernel for the extra rows (W.h accumulated in fp32, rounded to fp16, + XB, stored at
+# Xs). Against cuBLAS bmm only the accumulation order differs, and only in draft logits; the target verifies.
+# LLMT_DYNROW=0 = the unfused path; LLMT_DYNROW_CHECK=N compares both for N calls (max |diff|, -inf mask, argmax).
+import os as _os
+_DYNROW = _os.environ.get("LLMT_DYNROW", "1") == "1"
+_DYNROW_CHECK = [int(_os.environ.get("LLMT_DYNROW_CHECK", "0"))]
+try:
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _dyn_extra_kernel(W_ptr, h_ptr, XB_ptr, Xs_ptr, out_ptr, E, K, sWb, sWe, shb, sxb, sXb, sob,
+                          BE: tl.constexpr, BK: tl.constexpr):
+        b = tl.program_id(0)
+        e = tl.program_id(1) * BE + tl.arange(0, BE)
+        em = e < E
+        acc = tl.zeros((BE,), tl.float32)
+        for k0 in range(0, K, BK):
+            k = k0 + tl.arange(0, BK)
+            km = k < K
+            w = tl.load(W_ptr + b.to(tl.int64) * sWb + e[:, None].to(tl.int64) * sWe + k[None, :],
+                        mask=em[:, None] & km[None, :], other=0.0)
+            hv = tl.load(h_ptr + b.to(tl.int64) * shb + k, mask=km, other=0.0)
+            acc += tl.sum(w.to(tl.float32) * hv.to(tl.float32)[None, :], axis=1)
+        xb = tl.load(XB_ptr + b.to(tl.int64) * sxb + e, mask=em, other=0.0)
+        v = acc.to(tl.float16) + xb
+        col = tl.load(Xs_ptr + b.to(tl.int64) * sXb + e, mask=em, other=0)
+        tl.store(out_ptr + b.to(tl.int64) * sob + col, v.to(out_ptr.dtype.element_ty), mask=em)
+except Exception:  # noqa
+    _DYNROW = False
+
+
+def _full_logits_fast(sub, inv, n_out, width, vocab, h, W, Xs, XB, SB):
+    from exl3cuda.tail_fuse import draft_scatter
+    if SB is not None:
+        sub = sub + SB
+    B = sub.shape[0]
+    out = sub.new_empty((B, width))
+    s2 = sub if sub.is_contiguous() else sub.contiguous()
+    draft_scatter(s2, inv, out, 128)                     # columns < n_out: static logits or -inf (block granular)
+    if W is not None and W.shape[1] > 0:
+        hh = h if h.dtype == W.dtype else h.to(W.dtype)
+        E, K = W.shape[1], W.shape[2]
+        BE = 32
+        _dyn_extra_kernel[(B, triton.cdiv(E, BE))](W, hh, XB, Xs, out, E, K, W.stride(0), W.stride(1), hh.stride(0),
+                                                    XB.stride(0), Xs.stride(0), out.stride(0), BE=BE, BK=256,
+                                                    num_warps=4)
+    return out[:, :vocab]
+
+
 def full_logits(sub: torch.Tensor, idx_long: torch.Tensor, width: int, vocab: int, h: torch.Tensor | None = None,
                 W: torch.Tensor | None = None, Xs: torch.Tensor | None = None, XB: torch.Tensor | None = None,
-                SB: torch.Tensor | None = None) -> torch.Tensor:
+                SB: torch.Tensor | None = None, inv: torch.Tensor | None = None,
+                n_out: int | None = None) -> torch.Tensor:
+    """The draft row; the fused path when TAIL-FUSE's block map (inv, n_out) is given and the strides allow it."""
+    if (_DYNROW and inv is not None and n_out is not None and width >= n_out and inv.numel() * 128 == n_out
+            and (W is None or (W.stride(2) == 1 and h is not None and h.stride(-1) == 1 and Xs.stride(1) == 1
+                               and XB.stride(1) == 1))):
+        fast = _full_logits_fast(sub, inv, n_out, width, vocab, h, W, Xs, XB, SB)
+        if _DYNROW_CHECK[0] <= 0:
+            return fast
+        _DYNROW_CHECK[0] -= 1
+        ref = _full_logits_ref(sub, idx_long, width, vocab, h, W, Xs, XB, SB)
+        fin = torch.isfinite(ref)
+        same_inf = bool(torch.equal(fin, torch.isfinite(fast)))
+        d = float((fast.float() - ref.float()).abs()[fin].max()) if bool(fin.any()) else 0.0
+        am = bool(torch.equal(fast.argmax(-1), ref.argmax(-1)))
+        if _DYNROW_CHECK[0] % 50 == 0 or not (same_inf and am):
+            import logging
+            logging.getLogger("vllm").info("DYN-ROW check: max|diff| %.3g, -inf mask %s, argmax %s (%d checks left)",
+                                           d, "same" if same_inf else "DIFFERENT", "same" if am else "DIFFERENT",
+                                           _DYNROW_CHECK[0])
+        return ref
+    return _full_logits_ref(sub, idx_long, width, vocab, h, W, Xs, XB, SB)
+
+
+def _full_logits_ref(sub: torch.Tensor, idx_long: torch.Tensor, width: int, vocab: int, h: torch.Tensor | None = None,
+                     W: torch.Tensor | None = None, Xs: torch.Tensor | None = None, XB: torch.Tensor | None = None,
+                     SB: torch.Tensor | None = None) -> torch.Tensor:
     """The CUDA draft row [B, vocab]: static logits (+ SB bias at the prompt tokens' static positions) at idx, the
     rows' extra logits (W [B, E, K] . h [B, K] + XB: bias, or -inf on pads) scattered to Xs (real extra ids, pads at
     virtual columns >= the lm_head width), -inf elsewhere. width = row width incl. the virtual columns (>= max(Xs) + 1).

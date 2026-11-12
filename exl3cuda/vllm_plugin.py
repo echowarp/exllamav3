@@ -958,10 +958,11 @@ def _dyn_draft_row(d, attr, sub, h, width, vocab):
         return None
     _dyn_count(mgr, "dyn")
     from .draftdyn import full_logits
+    inv, n_out = d.get("tail_inv"), d.get("tail_n_out")     # TAIL-FUSE's inverse block map (None = unfused path)
     if Ep <= 0:
-        return full_logits(sub, d["idx"], width, vocab, SB=SB)
+        return full_logits(sub, d["idx"], width, vocab, SB=SB, inv=inv, n_out=n_out)
     return full_logits(sub, d["idx"], g["width"], vocab, h=h, W=g["Wb"][:B, :Ep], Xs=g["Xs"][:B, :Ep],
-                       XB=g["XB"][:B, :Ep], SB=SB)
+                       XB=g["XB"][:B, :Ep], SB=SB, inv=inv, n_out=n_out)
 
 
 def _dyn_fail(where, e):
