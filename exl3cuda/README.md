@@ -19,6 +19,7 @@ stock path in place. Some features need companion patches to vLLM itself (noted 
 |---|---|
 | `__init__.py`, `pyproject.toml` | package; `pip install ./exl3cuda` (registers the vLLM plugin entry point) |
 | `int8_kernels.py`, `fused_kernels.py` | Triton int8 (W8A8) prefill GEMM pieces; fused trellis -> int8 decode (L2 split) |
+| `exl3_mma.py` | Triton EXL3 GEMM for 17-64 rows (decode each weight tile once per program) |
 
 Built kernels go to `exl3cuda/lib/` (ignored by git, installed as package data).
 
