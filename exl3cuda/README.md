@@ -29,6 +29,7 @@ stock path in place. Some features need companion patches to vLLM itself (noted 
 | `gdn_port.py`, `gdn_fast.py`, `csrc/gdnchunk/` | GDN prefill via the Magnitude kernel; fast GDN decode metadata |
 | `draftdyn.py`, `tools/quantize_draft.py` | DRAFT-DYN pieces; draft-head re-quantization tool |
 | `tail_fuse.py` | TAIL-FUSE decode tail fusions |
+| `llmt_lazyvis.py` | lazy vision tower (top-level module `llmt_lazyvis`, imported by the companion vLLM qwen3_vl.py hook) |
 
 Built kernels go to `exl3cuda/lib/` (ignored by git, installed as package data).
 
@@ -101,6 +102,8 @@ Production = the Qwen3.8-27B RTX 5090 service (int4_per_token_head KV, MTP k = 7
 | `EXL3_UNIFORM_SPEC` | default (1) | UNIFORM-SPEC: only all-spec-decode steps take the uniform-decode path (fixes NaN on 1 + k-token prefill chunks) |
 | `EXL3_MIX3D` | default (1) | MIX-3D: decode / verify rows of mixed steps use the split-softmax 3D attention kernel |
 | `EXL3_PROFILE_AT / _N` | unset | diagnosis: torch.profiler for N steps from step AT, top kernels logged |
+| `EXL3_LAZY_VISION` | 1 | lazyvis: vision tower in pinned host memory, loaded / streamed only for image requests (needs the companion vLLM qwen3_vl.py hook) |
+| `EXL3_LAZY_VISION_TTL / _MARGIN_MB / _MODE` | default (120 / 256 / auto) | lazyvis residency TTL, memory margin, auto / stream / resident |
 
 ## Building the kernels
 

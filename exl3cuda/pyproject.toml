@@ -14,7 +14,8 @@ exl3cuda = "exl3cuda.vllm_plugin:register"
 
 [tool.setuptools]
 packages = ["exl3cuda"]
-package-dir = { "exl3cuda" = "." }
+package-dir = { "exl3cuda" = ".", "" = "." }
+py-modules = ["llmt_lazyvis"]
 
 [tool.setuptools.package-data]
 exl3cuda = ["lib/*.so", "lib/*/*.so"]
