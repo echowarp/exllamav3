@@ -21,6 +21,7 @@ stock path in place. Some features need companion patches to vLLM itself (noted 
 | `int8_kernels.py`, `fused_kernels.py` | Triton int8 (W8A8) prefill GEMM pieces; fused trellis -> int8 decode (L2 split) |
 | `exl3_mma.py` | Triton EXL3 GEMM for 17-64 rows (decode each weight tile once per program) |
 | `vllm_plugin.py` | the vLLM plugin: `exl3` quantization config, linear methods, custom op `exl3cuda::linear` and all engine patches |
+| `gdn_rc.py` | Triton GDN recompute kernels |
 
 Built kernels go to `exl3cuda/lib/` (ignored by git, installed as package data).
 
@@ -48,6 +49,11 @@ Production = the Qwen3.8-27B RTX 5090 service (int4_per_token_head KV, MTP k = 7
 | `EXL3_NOMMAP_LOAD` | default (1) | weight loading without mmap through `llmt_kv.nommap_loader` (skipped when `llmt_kv` is not installed) |
 | `EXL3_GRAPH_DUMP` | unset | diagnosis: dump every captured CUDA graph as .dot to /root/.cache/graph-dump/ |
 | `EXL3_WHX` | unset | optional external weight-keeper loader (module `exl3cuda.whx_loader`, not part of this package) |
+| `EXL3_GDN_RECOMPUTE` | 1 | GDN recompute: MTP spec decoding with one committed SSM state per request (no 1 + k state pages); needs the companion vLLM gpu_model_runner hooks |
+| `EXL3_GDN_RC_SLOTS` | default (16) | GDN recompute pending-pool slots |
+| `EXL3_RC_FUSED_IN` | 1 | RC-FUSED-IN: q/k/v split, gating and output write inside the recompute kernel |
+| `EXL3_RC_SLICE` | 1 | RC-SLICE: mixed steps use views for the non-spec rows instead of gather/scatter (bit-identical) |
+| `EXL3_RC_BV / EXL3_RC_WARPS` | default (32 / 4) | recompute kernel tile / warps |
 
 ## Licenses
 

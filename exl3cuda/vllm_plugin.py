@@ -578,6 +578,206 @@ def _(x, layer_id, n):
 
 
 # ------------------------------------------------------------------------------------------------
+# GDN-RECOMPUTE, CUDA port of the XPU plugin's _patch_gdn_recompute / _rc_dispatch: MTP spec decoding
+# for the 48 GDN layers with ONE committed SSM state per request
+# (Triton kernel exl3cuda.gdn_rc.gdn_recompute), so MambaSpec.num_speculative_blocks = 0 and a running request no
+# longer reserves 1 + k state pages per GDN group. The runner-side bookkeeping (pool slot / parity / pending count /
+# decode-time boundary states) is in the patched vLLM gpu_model_runner.py (_llmt_gdn_rc). EXL3_GDN_RECOMPUTE=1.
+GDN_RC = {"on": os.environ.get("EXL3_GDN_RECOMPUTE", "0") == "1", "S": int(os.environ.get("EXL3_GDN_RC_SLOTS", "16"))}
+
+
+def _rc_alloc_all(static_forward_context, device):
+    """Pending pools for every GDN layer, allocated at KV-cache init (before CUDA-graph capture: a pool zeroed inside
+    a captured graph would be re-zeroed on every replay)."""
+    T1 = GDN_RC.get("T1", 7); S = GDN_RC["S"]; n = 0
+    for name in GDN_RC.get("layer_group", {}):
+        layer = static_forward_context.get(name)
+        if layer is None or hasattr(layer, "_exl3_pool"):
+            continue
+        H = layer.num_k_heads // layer.tp_size; HV = layer.num_v_heads // layer.tp_size
+        K = layer.head_k_dim; V = layer.head_v_dim
+        layer._exl3_pool = (torch.zeros(2, S, T1, H, K, device=device), torch.zeros(2, S, T1, HV, V, device=device),
+                            torch.zeros(2, S, T1, HV, device=device), torch.zeros(2, S, T1, HV, device=device))
+        n += 1
+    logger.info("exl3: GDN recompute: pending pools for %d layers (T1=%d, %d slots)", n, T1, S)
+
+
+GDN_RC["alloc"] = _rc_alloc_all
+
+
+def _patch_gdn_recompute():
+    if not GDN_RC["on"]:
+        return
+    import dataclasses
+    try:
+        from vllm.model_executor.layers.mamba import abstract as mabs
+        from vllm.v1.kv_cache_interface import MambaSpec
+        from vllm.model_executor.layers.mamba import mamba_utils as mmu
+        from vllm.v1.worker import mamba_utils as wmu
+        from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn as qg
+    except Exception as e:  # noqa
+        logger.warning("exl3: GDN recompute not installed (%s)", e)
+        return
+    if getattr(mabs.MambaBase, "_exl3_rc", False):
+        return
+    # 1. no speculative state blocks (as on the XPU)
+    orig_spec = mabs.MambaBase.get_kv_cache_spec
+
+    def get_kv_cache_spec(self, vllm_config):
+        spec = orig_spec(self, vllm_config)
+        if isinstance(spec, MambaSpec) and spec.num_speculative_blocks:
+            GDN_RC["T1"] = spec.num_speculative_blocks + 1
+            spec = dataclasses.replace(spec, num_speculative_blocks=0)
+        return spec
+    mabs.MambaBase.get_kv_cache_spec = get_kv_cache_spec
+    mabs.MambaBase._exl3_rc = True
+
+    # 2. block-crossing SSM copy takes the committed state (no accept bias); same function object (identity checks)
+    def _temporal(state, block_ids, cur_block_idx, num_accepted_tokens):
+        src_state = state[block_ids[cur_block_idx]]
+        return MambaCopySpec(start_addr=src_state.data_ptr(), num_elements=src_state.numel())
+    mmu.get_temporal_copy_spec.__code__ = _temporal.__code__
+
+    # 3. fused postprocess: no SSM copies (the kernel stores decode-time boundary states itself)
+    orig_init = wmu.MambaSpecDecodeGPUContext.initialize_from_forward_context
+
+    def initialize_from_forward_context(self, *a, **kw):
+        was = self.is_initialized
+        orig_init(self, *a, **kw)
+        if not was:
+            self.state_inner_sizes.masked_fill_(self.state_conv_widths == 0, 0)
+            logger.info("exl3: GDN recompute: postprocess SSM copies disabled")
+    wmu.MambaSpecDecodeGPUContext.initialize_from_forward_context = initialize_from_forward_context
+
+    # 4. the CUDA layer calls self._forward_core inside the opaque custom op (runtime branches are fine there)
+    cls = qg.QwenGatedDeltaNetAttention
+    orig_core = cls._forward_core
+
+    def _forward_core(self, mixed_qkv, b, a, core_attn_out):
+        from vllm.forward_context import get_forward_context
+        fc = get_forward_context()
+        md_all = fc.attn_metadata
+        md = md_all.get(self.prefix) if isinstance(md_all, dict) else None
+        if (md is None or md.spec_sequence_masks is None or int(md.num_spec_decodes or 0) == 0
+                or "buf" not in GDN_RC or not hasattr(self, "_exl3_pool")):
+            return orig_core(self, mixed_qkv, b, a, core_attn_out)
+        return _rc_forward(self, orig_core, md, md_all, mixed_qkv, b, a, core_attn_out)
+    cls._forward_core = _forward_core
+    logger.info("exl3: GDN recompute enabled (num_speculative_blocks = 0, %d pending slots)", GDN_RC["S"])
+
+
+# RC-FUSED-IN: gdn_rc.gdn_recompute_fused does the q/k/v split, gating and output write inside
+# the recompute kernel (~12 fewer tiny launches per GDN layer); EXL3_RC_FUSED_IN=1.
+_RC_FUSED_IN = os.environ.get("EXL3_RC_FUSED_IN", "0") == "1"
+# RC-SLICE (on the XPU the gather/scatter cost 5.9% of a mixed 30k-token step):
+# in mixed steps the non-spec (prefill) rows were gathered with index_select per GDN layer and the output scattered back
+# with index_copy. GDN-RC already requires the spec rows to lead the batch (runner sets GDN_RC["lead"] per step), so
+# the non-spec tokens are the contiguous range [num_spec_decode_tokens, num_actual_tokens): use views, and let the
+# prefill path write straight into core_attn_out. Same rows, same order -> bit-identical. EXL3_RC_SLICE=1.
+_RC_SLICE = os.environ.get("EXL3_RC_SLICE", "0") == "1"
+
+
+def _rc_forward(self, orig_core, md, md_all, mixed_qkv, b, a, core_attn_out):
+    import dataclasses
+    import torch.nn.functional as F
+    from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_update
+    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import is_conv_state_dim_first
+    from .gdn_rc import gdn_recompute
+    H = self.num_k_heads // self.tp_size; HV = self.num_v_heads // self.tp_size
+    K, V = self.head_k_dim, self.head_v_dim
+    KD = H * K
+    ns = int(md.num_spec_decodes)
+    nact = int(md.num_actual_tokens)
+    kvc = self.kv_cache
+    conv_state = kvc[0] if is_conv_state_dim_first() else kvc[0].transpose(-1, -2)
+    ssm_state = kvc[1]
+    conv_w = self.conv1d.weight.view(self.conv1d.weight.size(0), self.conv1d.weight.size(2))
+    pure = int(md.num_prefills) == 0 and int(md.num_decodes) == 0
+    mixed_qkv, b, a = mixed_qkv[:nact], b[:nact], a[:nact]
+    ts = int(md.num_spec_decode_tokens or 0)
+    sliced = _RC_SLICE and not pure and GDN_RC.get("lead", False) and ts > 0
+    if not pure:
+        # prefill / non-spec rows: the original path on the non-spec subset with a spec-free metadata copy
+        nsi = md.non_spec_token_indx
+        nT = nact - ts if sliced else int(nsi.numel())
+        md2 = dataclasses.replace(md, spec_sequence_masks=None, num_spec_decodes=0, num_spec_decode_tokens=0,
+                                  spec_query_start_loc=None, spec_state_indices_tensor=None, spec_token_indx=None,
+                                  non_spec_token_indx=None, num_accepted_tokens=None, num_actual_tokens=nT)
+        if sliced:   # RC-SLICE: views, output written in place
+            out2 = core_attn_out[ts:nact]
+            out2.zero_()
+            md_all[self.prefix] = md2
+            try:
+                orig_core(self, mixed_qkv[ts:nact], b[ts:nact], a[ts:nact], out2)
+            finally:
+                md_all[self.prefix] = md
+            sq, sb, sa = mixed_qkv[:ts], b[:ts], a[:ts]
+        else:
+            out2 = torch.zeros((nT, HV, V), dtype=core_attn_out.dtype, device=core_attn_out.device)
+            md_all[self.prefix] = md2
+            try:
+                orig_core(self, mixed_qkv.index_select(0, nsi), b.index_select(0, nsi), a.index_select(0, nsi), out2)
+            finally:
+                md_all[self.prefix] = md
+            core_attn_out[:nact].index_copy_(0, nsi, out2)
+            si = md.spec_token_indx
+            sq, sb, sa = mixed_qkv.index_select(0, si), b.index_select(0, si), a.index_select(0, si)
+    else:
+        sq, sb, sa = mixed_qkv, b, a
+    T = sq.size(0)
+    T1 = GDN_RC.get("T1", 7)
+    if _RC_FUSED_IN:
+        # the per-step index tensors are the same for every GDN layer of a group: build them once per metadata object
+        key = (ns, GDN_RC.get("step", 0))   # step counter from the runner's per-step GDN-RC hook (metadata objects
+        cached = getattr(md, "_llmt_rc_idx", None)   # or their persistent buffers may be reused across steps)
+        if cached is None or cached[0] != key:
+            cached = (key, md.spec_state_indices_tensor[:ns, 0].to(torch.int32).contiguous(),
+                      md.spec_query_start_loc[:ns + 1].to(torch.int32).contiguous())
+            try:
+                object.__setattr__(md, "_llmt_rc_idx", cached)
+            except Exception:
+                pass
+        sidx, qsl = cached[1], cached[2]
+    else:
+        sidx = md.spec_state_indices_tensor[:ns, 0].to(torch.int32).contiguous()
+        qsl = md.spec_query_start_loc[:ns + 1].to(torch.int32).contiguous()
+    x = causal_conv1d_update(sq, conv_state, conv_w, self.conv1d.bias, self.activation, conv_state_indices=sidx,
+                             num_accepted_tokens=md.num_accepted_tokens, query_start_loc=md.spec_query_start_loc,
+                             max_query_len=T1, validate_data=False)
+    if _RC_FUSED_IN and x.stride(-1) == 1:
+        from .gdn_rc import gdn_recompute_fused
+        st = GDN_RC["buf"]
+        gi = GDN_RC["layer_group"].get(self.prefix, 0)
+        sa_ = sa if sa.stride(-1) == 1 else sa.contiguous()
+        sb_ = sb if sb.stride(-1) == 1 else sb.contiguous()
+        direct = pure and core_attn_out.dim() == 3 and core_attn_out.stride(-1) == 1 and core_attn_out.stride(-2) == V
+        o = core_attn_out[:T] if direct else torch.empty((T, HV, V), dtype=core_attn_out.dtype, device=core_attn_out.device)
+        gdn_recompute_fused(x, H, HV, K, V, sa_, sb_, self.A_log, self.dt_bias, o, ssm_state, sidx, *self._exl3_pool,
+                            st["npend"][:ns], st["slot"][:ns], st["par"][:ns], qsl, T1, K ** -0.5,
+                            st["bidx"][:ns], st["bblk"][gi, :ns])
+        if not direct:
+            if pure:
+                core_attn_out[:T].copy_(o)
+            else:
+                core_attn_out[:nact].index_copy_(0, md.spec_token_indx, o)
+        return
+    q = x[:, :KD].reshape(T, H, K).contiguous()
+    k = x[:, KD:2 * KD].reshape(T, H, K).contiguous()
+    v = x[:, 2 * KD:].reshape(T, HV, V).contiguous()
+    g = (-torch.exp(self.A_log.float()) * F.softplus(sa.float() + self.dt_bias.float())).contiguous()
+    beta = torch.sigmoid(sb.float()).contiguous()
+    o = torch.empty((T, HV, V), dtype=core_attn_out.dtype, device=core_attn_out.device)
+    st = GDN_RC["buf"]
+    gi = GDN_RC["layer_group"].get(self.prefix, 0)
+    gdn_recompute(q, k, v, g, beta, o, ssm_state, sidx, *self._exl3_pool, st["npend"][:ns], st["slot"][:ns],
+                  st["par"][:ns], qsl, T1, K ** -0.5, st["bidx"][:ns], st["bblk"][gi, :ns])
+    if pure:
+        core_attn_out[:T].copy_(o)
+    else:
+        core_attn_out[:nact].index_copy_(0, md.spec_token_indx, o)
+
+
+# ------------------------------------------------------------------------------------------------
 # KV-BLOCK-ALIGN: round the hybrid-negotiated attention block size up to a multiple of
 # EXL3_KV_BLOCK_ALIGN (default 64), exactly like the XPU plugin's patch_xpu_block_size (EXL3_KV_BLOCK_EXACT=1). Both
 # GPUs negotiate 1616 tokens for Qwen3.8 + int8 KV; the XPU rounds to 1664 for its GDN kernel, so CUDA must too or
@@ -668,4 +868,5 @@ def register():
         except Exception as e:  # noqa: never block engine start; weights load from disk
             logger.warning("exl3: WHX not active (%s: %s)", type(e).__name__, e)
     _patch_block_align()
+    _patch_gdn_recompute()
     return None
