@@ -97,6 +97,10 @@ Production = the Qwen3.8-27B RTX 5090 service (int4_per_token_head KV, MTP k = 7
 | `EXL3_CAPTURE_MTP_H / _EVERY` | unset | capture X^T X of the MTP linears' inputs for calibrated draft re-quantization (eager engine) |
 | `EXL3_TAIL_FUSE` | 1 | TAIL-FUSE: bit-exact trimming of the decode small-kernel tail; 1 = all parts or a list of cat, scratch, conv, ks, dlog |
 | `EXL3_TAIL_CONV_BN / _WARPS` | default (auto) | TAIL-FUSE conv tiling |
+| `EXL3_DYN_SD_FULL` | 2 | keep FULL decode cudagraphs with dynamic speculative depth (2 = FULL graphs for every depth of the schedule) |
+| `EXL3_UNIFORM_SPEC` | default (1) | UNIFORM-SPEC: only all-spec-decode steps take the uniform-decode path (fixes NaN on 1 + k-token prefill chunks) |
+| `EXL3_MIX3D` | default (1) | MIX-3D: decode / verify rows of mixed steps use the split-softmax 3D attention kernel |
+| `EXL3_PROFILE_AT / _N` | unset | diagnosis: torch.profiler for N steps from step AT, top kernels logged |
 
 ## Building the kernels
 
