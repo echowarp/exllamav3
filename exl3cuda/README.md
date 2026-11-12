@@ -25,6 +25,7 @@ stock path in place. Some features need companion patches to vLLM itself (noted 
 | `i8fa_prefill.py`, `csrc/i8fa/` | I8FA int8-KV prefill helpers and kernels |
 | `csrc/fa16/` | FA16 FlashAttention 2 variant (patch + binding + build) |
 | `csrc/va/` | VA verify attention kernel (int8 KV) |
+| `csrc/va4/`, `csrc/kvw4/` | VA4 verify attention and KVW4 KV write (int4 KV) |
 
 Built kernels go to `exl3cuda/lib/` (ignored by git, installed as package data).
 
@@ -70,6 +71,14 @@ Production = the Qwen3.8-27B RTX 5090 service (int4_per_token_head KV, MTP k = 7
 | `EXL3_VA` | 1 | VA: custom CUDA verify / decode attention (<= 8 query rows) for int8 KV; also enables VA4 |
 | `EXL3_VA_SO` | default (`<package>/lib/va5090.so`) | VA library |
 | `EXL3_VA_WAVE` | default (42) | VA CTA-segments per KV head and sequence (one wave on 170 SMs) |
+| `EXL3_VA4` | default (1) | VA4: int4_per_token_head verify / decode attention (with EXL3_VA=1) |
+| `EXL3_VA4_SO` | `<package>/lib/va4c.so` | VA4 library (the code default names an older `va4b.so` variant that is not shipped: set this) |
+| `EXL3_VA4_OP` | va4c | VA4 op namespace (code default `va4b`: set `va4c` for the kernel in csrc/va4) |
+| `EXL3_VA4_PREFILL_Q` | default (64) | VA4-PSEUDO: prefills up to this many rows go through VA4 as 8-row pseudo-sequences |
+| `EXL3_I4FA` | default (1) | I4FA: int4 KV prefill = gather-dequant + rotated q + the same FA2 / FA16 calls |
+| `EXL3_KVW4` | default (1) | KVW4: fused int4 KV-cache write |
+| `EXL3_KVW4_SO` | default (`<package>/lib/kvw4.so`) | KVW4 library |
+| `EXL3_KSMOOTH_INT4` | default (1) | KS4: K smoothing applied to int4 KV too |
 
 ## Building the kernels
 
@@ -99,6 +108,11 @@ One nvcc needs ~12 GB RAM (`MAX_JOBS=1`); `build-seq.sh fa_f:1:2 fa_b:1:0` build
 ### VA (`csrc/va`)
 
     python3 exl3cuda/csrc/va/build.py        # -> lib/va5090.so (torch.ops.va5090)
+
+### VA4 and KVW4 (`csrc/va4`, `csrc/kvw4`)
+
+    python3 exl3cuda/csrc/va4/build.py       # -> lib/va4c.so (torch.ops.va4c); extra nvcc flags are passed through
+    python3 exl3cuda/csrc/kvw4/build.py      # -> lib/kvw4.so (torch.ops.kvw4)
 
 ## Data files you supply
 

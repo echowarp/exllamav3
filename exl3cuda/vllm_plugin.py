@@ -608,7 +608,18 @@ def _patch_ksmooth():
         def do_kv_cache_update(self, layer, key, value, kv_cache, slot_mapping):
             name = getattr(layer, "layer_name", None)
             qm = getattr(self, "_kv_quant_mode", None)
-            if (qm == KVQuantMode.INT8_PER_TOKEN_HEAD and name is not None):
+            if qm == KVQuantMode.INT4_PER_TOKEN_HEAD and name is not None and name in kmeans \
+                    and os.environ.get("EXL3_KSMOOTH_INT4", "1") == "1":
+                # KS4: K smoothing for int4 too (the XPU int4 KV write subtracts the same table before the
+                # rotation; 5090 int4 teacher-forced KL without it: 0.0049-0.0051 vs 0.0038 on the XPU with it)
+                m = getattr(self, "_exl3_km", None)
+                if m is None or m.device != key.device:
+                    m = self._exl3_km = kmeans[name].to(device=key.device, dtype=key.dtype)
+                    if not getattr(TritonAttentionImpl, "_exl3_ks4_logged", False):
+                        TritonAttentionImpl._exl3_ks4_logged = True
+                        logger.info("exl3: KS4: K smoothing applied to int4 KV")
+                key = key - m
+            elif (qm == KVQuantMode.INT8_PER_TOKEN_HEAD and name is not None):
                 if cal_path:
                     valid = slot_mapping[: key.shape[0]] >= 0
                     ks = key[: valid.shape[0]][valid].float()
@@ -740,6 +751,68 @@ def _i8_prefill_fa(q, key_cache, value_cache, pages, seq_len, scale, out):
     return out
 
 
+# I4FA (int4 KV, same strategy as the XPU plugin: own prefill path; stock unified_attention_int4 prefill is
+# slow and its fp32 single_rht temporaries OOM'd at 8 x 4000): int4_per_token_head prefill = gather-dequant of the
+# paged int4 cache into fp16 K / V in vLLM's rotated space (n - zp) * s, q rotated by fp16 matmul with
+# diag(signs) H / 256 (entries +-1/256: exact products, fp32 accumulation), the same FA2 / FA16 calls and LSE merge as
+# the int8 path, output un-rotated with H diag(signs) / 256. EXL3_I4FA=1 (default) on.
+_I4FA = os.environ.get("EXL3_I4FA", "1") == "1"
+_I4ROT: dict = {}
+
+
+def _i4_rot(device):
+    r = _I4ROT.get(device)
+    if r is None:
+        from vllm.v1.attention.ops.int4_per_token_head import _get_rht_signs
+        sg = _get_rht_signs(256, 0, device).float()
+        H = torch.ones(1, 1, device=device)
+        while H.shape[0] < 256:
+            H = torch.cat([torch.cat([H, H], 1), torch.cat([H, -H], 1)], 0)
+        fwd = (sg[:, None] * H / 256).half()          # q_r = q @ fwd  (= H(D q) / 256 as a row vector product)
+        inv = (H * sg[None, :] / 256).half()          # o = o_r @ inv  (= D H o_r / 256)
+        r = _I4ROT[device] = (fwd.contiguous(), inv.contiguous(), sg.contiguous())
+    return r
+
+
+def _i4_gather_dequant(cache, pages, bs, start, end):
+    """cache: int4 per-token-head view [blocks, BS, H, 132] uint8 (128 B nibbles, f32 scale with zp in the low 4 bits)
+    -> fp16 [n, H, 256] in the rotated space."""
+    p0 = start // bs
+    p1 = (end + bs - 1) // bs
+    blk = cache.index_select(0, pages[p0:p1]).flatten(0, 1)
+    off = start - p0 * bs
+    x = blk[off: off + (end - start)]
+    w = x[..., 128:132].contiguous().view(torch.int32)               # [n, H, 1]
+    zp = (w & 15).to(torch.float32)
+    sc = (w & -16).view(torch.float32)
+    d = x[..., :128]
+    n4 = torch.stack([d & 15, d >> 4], -1).flatten(-2).to(torch.float32)
+    return ((n4 - zp) * sc).to(torch.float16)
+
+
+def _i4_prefill_fa(q, key_cache, value_cache, pages, seq_len, scale, out):
+    fwd, inv, _ = _i4_rot(q.device)
+    Q, H, bs = q.shape[0], q.shape[1], key_cache.shape[1]
+    qr = (q.reshape(Q * H, 256) @ fwd).view(Q, H, 256)
+    prefix = seq_len - Q
+    parts = []
+    for s0 in range(0, prefix, _FA_KB):
+        e0 = min(s0 + _FA_KB, prefix)
+        parts.append(_fa(qr, _i4_gather_dequant(key_cache, pages, bs, s0, e0),
+                         _i4_gather_dequant(value_cache, pages, bs, s0, e0), False, scale))
+    parts.append(_fa(qr, _i4_gather_dequant(key_cache, pages, bs, prefix, seq_len),
+                     _i4_gather_dequant(value_cache, pages, bs, prefix, seq_len), True, scale))
+    if len(parts) == 1:
+        o_r = parts[0][0]
+    else:
+        lses = torch.stack([pp[1] for pp in parts])            # [n, H, Q]
+        m = lses.amax(0)
+        w = torch.exp(lses - m)
+        num = sum(pp[0].float() * wi.transpose(0, 1).unsqueeze(-1) for pp, wi in zip(parts, w))
+        o_r = (num / w.sum(0).transpose(0, 1).unsqueeze(-1)).to(torch.float16)
+    out.copy_((o_r.reshape(Q * H, 256) @ inv).view(Q, H, 256))
+    return out
+
 def _patch_int8kv_fa():
     if os.environ.get("EXL3_INT8KV_FA", "1") != "1":
         return
@@ -829,9 +902,145 @@ def _patch_int8kv_fa():
                                  max(1, _VA_WAVE // nseq), key_cache.shape[1], self.scale, md.max_query_len)
         return True
 
+    # VA4 (goal: int8-KV short-context speed with much better long context; same strategies as the XPU plugin):
+    # int4_per_token_head verify / decode attention (<= 8 query rows) on csrc/va4/va4c_kernel.cu: q pre-rotation +
+    # int4 record [K 128 | ks | V 128 | vs] + un-rotating merge. Same split / scratch as VA. EXL3_VA4=1 (default with
+    # EXL3_VA=1), EXL3_VA4_SO = library, EXL3_VA4_OP = its op namespace (va4c for the kernel in this package).
+    _VA4 = _VA and os.environ.get("EXL3_VA4", "1") == "1"
+
+    def _va4_try(self, query, kv_cache, md, output):
+        if (md.max_query_len > 8 or self.num_heads != 24 or self.num_kv_heads != 4 or self.head_size != 256
+                or self._kv_quant_mode != KVQuantMode.INT4_PER_TOKEN_HEAD
+                or self.alibi_slopes is not None or self.sinks is not None
+                or self.sliding_window not in (None, (-1, -1)) or (self.logits_soft_cap or 0) != 0
+                or not getattr(md, "causal", True) or getattr(md, "mm_prefix_range_tensor", None) is not None
+                or query.dtype != torch.float16):
+            return False
+        nseq = md.seq_lens.shape[0]
+        if nseq > _VA_WAVE or not _va_ready(query.device):
+            return False
+        if "va4" not in _VA_ST:
+            try:
+                torch.ops.load_library(os.environ.get("EXL3_VA4_SO", os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib", "va4b.so")))
+                from vllm.v1.attention.ops.int4_per_token_head import _get_rht_signs
+                _VA_ST["signs"] = _get_rht_signs(256, 0, query.device).float().contiguous()
+                _VA_ST["qr"] = torch.empty(_VA_WAVE * 8, 24, 256, dtype=torch.float16, device=query.device)
+                _VA_ST["va4"] = True
+                logger.info("exl3: VA4 on: int4 verify attention (pre-rotated q, un-rotating merge)")
+            except Exception as e:  # noqa: BLE001
+                _VA_ST["va4"] = False
+                logger.warning("exl3: VA4 not available (%r): stock int4 Triton", e)
+        if not _VA_ST["va4"]:
+            return False
+        key_cache, value_cache = self._pth_key_value_caches(kv_cache)
+        kk = key_cache.data_ptr()
+        lay = _VA_ST.setdefault("lay4", {})
+        ok = lay.get(kk)
+        if ok is None:
+            ks, vs = self._k_scale_cache, self._v_scale_cache
+            ok = (key_cache.dtype == torch.uint8 and key_cache.stride(3) == 1 and key_cache.stride(1) % 8 == 0
+                  and value_cache.data_ptr() == kk + 132 and ks is not None and vs is not None
+                  and ks.data_ptr() == kk + 128 and vs.data_ptr() == kk + 260
+                  and key_cache.stride(0) % 8 == 0 and key_cache.stride(2) % 8 == 0)
+            lay[kk] = ok
+            if not ok:
+                logger.warning("exl3: VA4: unexpected KV layout (strides %s): stock int4 Triton", tuple(key_cache.stride()))
+        if not ok:
+            return False
+        T = md.num_actual_tokens
+        if T > _VA_ST["qr"].shape[0]:
+            return False
+        q = query[:T].view(-1, self.num_heads, 256)
+        out = output[:T].view(-1, self.num_heads, 256)
+        if not (q.stride(2) == 1 and out.stride(2) == 1):
+            return False
+        _VA_ST["n4"] = _VA_ST.get("n4", 0) + 1
+        if _VA_ST["n4"] in (1, 1000):
+            logger.info("exl3: VA4 dispatch #%d (q strides %s, capturing %s)", _VA_ST["n4"], tuple(q.stride()),
+                        torch.cuda.is_current_stream_capturing())
+        getattr(torch.ops, os.environ.get("EXL3_VA4_OP", "va4b")).forward(q, key_cache, key_cache.stride(0), key_cache.stride(2), key_cache.stride(1),
+                              md.block_table, md.seq_lens, md.query_start_loc, out, _VA_ST["po"], _VA_ST["pm"],
+                              _VA_ST["pl"], _VA_ST["signs"], _VA_ST["qr"], max(1, _VA_WAVE // nseq), key_cache.shape[1],
+                              self.scale, md.max_query_len)
+        return True
+
+    def _i4_forward_mixed(self, query, kv_cache, md, output):
+        """int4 prefill / mixed step: long rows through _i4_prefill_fa, the decode / verify rows next to the chunk
+        through va4 on a subset (stock int4 Triton if va4 is unavailable)."""
+        key_cache, value_cache = self._pth_key_value_caches(kv_cache)
+        T = md.num_actual_tokens
+        nr = md.query_start_loc.shape[0] - 1
+        H = self.num_heads
+        q = query[:T].view(-1, H, 256)
+        out = output[:T].view(-1, H, 256)
+        qcpu = getattr(md, "query_start_loc_cpu", None)
+        qsl = qcpu[: nr + 1].tolist() if qcpu is not None and qcpu.shape[0] >= nr + 1 else md.query_start_loc[: nr + 1].cpu().tolist()
+        scpu = getattr(md, "seq_lens_cpu", None)
+        sl = scpu[:nr].tolist() if scpu is not None and scpu.shape[0] >= nr else md.seq_lens[:nr].cpu().tolist()
+        # VA4-PSEUDO: rows of a prefill with <= EXL3_VA4_PREFILL_Q (64) rows go through va4 as 8-row
+        # pseudo-sequences (rows c..c+7 of a chunk ending at seq_len L see L - (b - e) tokens: exact causal mask),
+        # together with the decode / verify rows, in launches of <= _VA_WAVE pseudo-sequences; longer prefills I4FA.
+        pq = int(os.environ.get("EXL3_VA4_PREFILL_Q", "64"))
+        use_va4 = _VA4 and _va_ready(q.device) and bool(_VA_ST.get("va4"))
+        pseudo = []
+        for i in range(nr):
+            a, b = qsl[i], qsl[i + 1]
+            n = b - a
+            if n <= 0:
+                continue
+            if n <= VQ and use_va4:
+                pseudo.append((i, a, b, sl[i]))
+            elif n <= pq and use_va4:
+                for c in range(a, b, 8):
+                    e = min(c + 8, b)
+                    pseudo.append((i, c, e, sl[i] - (b - e)))
+            elif n > VQ:
+                _i4_prefill_fa(q[a:b], key_cache, value_cache, md.block_table[i].to(torch.int32), sl[i],
+                               float(self.scale), out[a:b])
+            else:
+                pseudo.append((i, a, b, sl[i]))          # va4 unavailable: stock path below
+        if not pseudo:
+            return output
+        for g0 in range(0, len(pseudo), _VA_WAVE):
+            grp = pseudo[g0:g0 + _VA_WAVE]
+            rows = torch.cat([torch.arange(c, e) for _, c, e, _ in grp]).to(q.device)
+            lens = [e - c for _, c, e, _ in grp]
+            cu = torch.tensor([0] + list(itertools.accumulate(lens)), dtype=torch.int32, device=q.device)
+            idx = torch.tensor([i for i, _, _, _ in grp], device=q.device)
+            sls = torch.tensor([L for _, _, _, L in grp], dtype=torch.int32, device=q.device)
+            qs = q.index_select(0, rows).contiguous()
+            os_ = torch.empty_like(qs)
+            bt = md.block_table.index_select(0, idx)
+            if use_va4:
+                getattr(torch.ops, os.environ.get("EXL3_VA4_OP", "va4b")).forward(
+                    qs, key_cache, key_cache.stride(0), key_cache.stride(2), key_cache.stride(1), bt, sls, cu, os_,
+                    _VA_ST["po"], _VA_ST["pm"], _VA_ST["pl"], _VA_ST["signs"], _VA_ST["qr"],
+                    max(1, _VA_WAVE // len(grp)), key_cache.shape[1], self.scale, max(lens))
+            else:
+                unified_attention(q=qs, k=key_cache, v=value_cache, out=os_, cu_seqlens_q=cu, max_seqlen_q=max(lens),
+                                  seqused_k=sls, max_seqlen_k=max(L for _, _, _, L in grp),
+                                  softmax_scale=self.scale, causal=True, alibi_slopes=None, window_size=(-1, -1),
+                                  block_table=bt, softcap=self.logits_soft_cap,
+                                  q_descale=None, k_descale=None, v_descale=None,
+                                  kv_quant_mode=self._kv_quant_mode,
+                                  k_scale_cache=self._k_scale_cache, v_scale_cache=self._v_scale_cache)
+            out.index_copy_(0, rows, os_)
+        return output
+
     def forward(self, layer, query, key, value, kv_cache, attn_metadata, output, output_scale=None,
                 output_block_scale=None):
         md = attn_metadata
+        if (_VA4 and md is not None and md.max_query_len <= VQ and output_scale is None and output_block_scale is None
+                and getattr(self, "_kv_quant_mode", None) == KVQuantMode.INT4_PER_TOKEN_HEAD
+                and _va4_try(self, query, kv_cache, md, output)):
+            return output
+        if (_I4FA and md is not None and md.max_query_len > VQ
+                and getattr(self, "_kv_quant_mode", None) == KVQuantMode.INT4_PER_TOKEN_HEAD and self.head_size == 256
+                and self.num_heads == 24 and self.num_kv_heads == 4
+                and output_scale is None and output_block_scale is None and self.alibi_slopes is None
+                and self.sinks is None and getattr(md, "mm_prefix_range_tensor", None) is None
+                and self.sliding_window in (None, (-1, -1)) and getattr(md, "causal", True)):
+            return _i4_forward_mixed(self, query, kv_cache, md, output)
         if (_VA and md is not None and md.max_query_len <= VQ and output_scale is None and output_block_scale is None
                 and _va_try(self, query, kv_cache, md, output)):
             return output
@@ -1156,6 +1365,39 @@ def _patch_graph_dump():
     logger.info("EXL3_GRAPH_DUMP: dumping captured CUDA graphs to %s", out)
 
 
+def _patch_kvw4():
+    """KVW4 (port of the XPU int4 KV write): fused int4_per_token_head KV write (csrc/kvw4/kvw4_kernel.cu: signs, fp32
+    Hadamard, fp16 round, vLLM's quantization math, nibble pack; one launch for K and V) instead of vLLM's
+    reshape_and_cache_int4 (2 x single_rht through bf16 hadacore + casts + the pack kernel; eager 449 us vs 8 us at 8
+    tokens). 97 % byte-equal to stock (stock rounds the input to bf16 first), error equal or lower. EXL3_KVW4=0 = off."""
+    if os.environ.get("EXL3_KVW4", "1") != "1":
+        return
+    try:
+        import vllm.v1.attention.ops.int4_per_token_head as i4m
+        torch.ops.load_library(os.environ.get("EXL3_KVW4_SO", os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib", "kvw4.so")))
+    except Exception as e:  # noqa
+        logger.warning("exl3: KVW4 not available (%s); stock int4 KV write", e)
+        return
+    orig = i4m.reshape_and_cache_int4
+    st = {}
+
+    def reshape_and_cache_int4(key, value, key_cache, value_cache, slot_mapping, *, k_scale_cache, v_scale_cache):
+        if (key.dtype == torch.float16 and value.dtype == torch.float16 and key.dim() == 3 and key.shape[-1] == 256
+                and key.stride(-1) == 1 and value.stride(-1) == 1 and key_cache.dtype == torch.uint8
+                and value_cache.data_ptr() == key_cache.data_ptr() + 132 and slot_mapping.dtype == torch.int64
+                and k_scale_cache.data_ptr() == key_cache.data_ptr() + 128):
+            sg = st.get(key.device)
+            if sg is None:
+                sg = st[key.device] = i4m._get_rht_signs(256, 0, key.device).float().contiguous()
+                logger.info("exl3: KVW4 on: fused int4 KV write")
+            torch.ops.kvw4.write(key, value, key_cache, key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
+                                 slot_mapping, key_cache.shape[1], sg)
+            return
+        return orig(key, value, key_cache, value_cache, slot_mapping, k_scale_cache=k_scale_cache,
+                    v_scale_cache=v_scale_cache)
+    i4m.reshape_and_cache_int4 = reshape_and_cache_int4
+
+
 def register():
     """vllm.general_plugins entry point (runs in every vLLM process)."""
     _patch_graph_dump()
@@ -1176,4 +1418,5 @@ def register():
     _patch_ksmooth()
     _patch_gdn_recompute()
     _patch_int8kv_fa()
+    _patch_kvw4()
     return None
