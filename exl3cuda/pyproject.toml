@@ -9,6 +9,9 @@ description = "EXL3 (exllamav3) quantized models in vLLM on NVIDIA CUDA (RTX 509
 readme = "README.md"
 requires-python = ">=3.10"
 
+[project.entry-points."vllm.general_plugins"]
+exl3cuda = "exl3cuda.vllm_plugin:register"
+
 [tool.setuptools]
 packages = ["exl3cuda"]
 package-dir = { "exl3cuda" = "." }
