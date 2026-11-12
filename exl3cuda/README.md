@@ -27,6 +27,7 @@ stock path in place. Some features need companion patches to vLLM itself (noted 
 | `csrc/va/` | VA verify attention kernel (int8 KV) |
 | `csrc/va4/`, `csrc/kvw4/` | VA4 verify attention and KVW4 KV write (int4 KV) |
 | `gdn_port.py`, `gdn_fast.py`, `csrc/gdnchunk/` | GDN prefill via the Magnitude kernel; fast GDN decode metadata |
+| `draftdyn.py`, `tools/quantize_draft.py` | DRAFT-DYN pieces; draft-head re-quantization tool |
 
 Built kernels go to `exl3cuda/lib/` (ignored by git, installed as package data).
 
@@ -84,6 +85,15 @@ Production = the Qwen3.8-27B RTX 5090 service (int4_per_token_head KV, MTP k = 7
 | `EXL3_GDN_PORT_SO` | default (`<package>/lib/gdn_chunk_mag.so`) | GDN-PORT extension |
 | `EXL3_GDN_PORT_ROWS` | default (64) | GDN-PORT scan tile |
 | `EXL3_GDN_FAST` | 1 | GDN-FAST: one Triton launch for the decode-step GDN metadata (2 = check every field against the original) |
+| `EXL3_DRAFT_VOCAB` | path to a 512-block draft vocab json | pruned MTP draft head: the drafter proposes from these 128-token vocab blocks (target verifies with the full head) |
+| `EXL3_DRAFT_VOCAB_FAR` | same file | GRADED-DRAFT: vocab for draft positions >= EXL3_DRAFT_FAR_FROM (same file = one shared head copy) |
+| `EXL3_DRAFT_FAR_FROM` | 2 | first draft position (0-based) that uses the far vocab |
+| `EXL3_DRAFT_WEIGHTS` | path to a 4-bit draft head | re-quantized draft head / MTP linears (tools/quantize_draft.py) |
+| `EXL3_DRAFT_DYN / _NEAR` | 256 / 128 | DRAFT-DYN: up to E extra draft-head rows per request (its most frequent prompt tokens), far / near passes |
+| `EXL3_DRAFT_BIAS` | 0 | DRAFT-DYN: drafter logit bias on prompt tokens |
+| `EXL3_DRAFT_DYN_GS / _BG / _DELAY_US` | default (64 / 1 / 2000) | DRAFT-DYN host int4 group size, background uploads, upload delay |
+| `EXL3_DRAFT_WINDOW` | unset | DRAFT-WINDOW: sliding window for the MTP layer's attention (drafts only) |
+| `EXL3_CAPTURE_MTP_H / _EVERY` | unset | capture X^T X of the MTP linears' inputs for calibrated draft re-quantization (eager engine) |
 
 ## Building the kernels
 
@@ -132,6 +142,14 @@ These are derived from a deployment's own traffic or weights and are not part of
 - **K smoothing table** (`EXL3_KSMOOTH`): not shipped. Generate it on your own traffic: run the engine eagerly
   (`--enforce-eager`) with `EXL3_KSMOOTH_CALIB=<out.pt>` (and int8 KV) over representative prompts; the plugin saves
   `{layer_name: mean[H, D]}` every 64 calls. Then serve with `EXL3_KSMOOTH=<out.pt>`.
+
+- **Draft vocabulary** (`EXL3_DRAFT_VOCAB`): not shipped. A json `{"block_size": 128, "blocks": [...]}` listing the
+  128-token vocab blocks the drafter may propose (block_size must be a multiple of 128). Rank blocks by token
+  frequency on text like your own model outputs and keep the top N (production uses 512 blocks); force-include
+  special tokens. The exl3xpu project's `scripts/draft_vocab.py` (MIT) builds one from a text corpus.
+- **Draft weights** (`EXL3_DRAFT_WEIGHTS`): not shipped. `tools/quantize_draft.py --bf16 <BF16 checkpoint dir>
+  --vocab <draft vocab json> --no-mtp --k-head 4 --out head4.safetensors` re-quantizes the draft head rows to 4 bpw
+  (drafts only: outputs stay exact). Needs exllamav3 and the BF16 weights of the model.
 
 ## Licenses
 

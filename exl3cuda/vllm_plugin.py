@@ -248,8 +248,23 @@ class Exl3LinearMethod(LinearMethodBase):
             a, b = bounds[gi], bounds[gi + 1]
             tr = layer.trellis.data if len(groups) == 1 else layer.trellis.data[:, a // 16: b // 16].contiguous()
             segs.append(dict(tr=tr, suh=layer.suh.data[g[0]].contiguous(), svh=layer.svh.data[a:b].contiguous()))
-        replaced = False
+        replaced = _draft_weights_swap(getattr(self, "prefix", None), groups, segs, layer.trellis.device)
+        _cap_key = _norm_key(getattr(self, "prefix", "") or "")
+        if isinstance(layer, ParallelLMHead) and os.environ.get("EXL3_DRAFT_VOCAB") and _spec_is_mtp():
+            _build_draft_head(layer, os.environ["EXL3_DRAFT_VOCAB"], cbt)
+            # GRADED-DRAFT: a smaller draft vocab for the deeper draft positions
+            # (EXL3_DRAFT_VOCAB_FAR, from position EXL3_DRAFT_FAR_FROM, 0-based): those passes read fewer head blocks.
+            far = os.environ.get("EXL3_DRAFT_VOCAB_FAR")
+            if far and os.path.realpath(far) == os.path.realpath(os.environ["EXL3_DRAFT_VOCAB"]):
+                layer.exl3_draft_far = layer.exl3_draft      # same vocab: share one copy (~250 MB)
+                logger.info("exl3: far draft vocab = near vocab: one head copy")
+            elif far:
+                _build_draft_head(layer, far, cbt, attr="exl3_draft_far")
         layer.exl3_id, layer.exl3_n = _register(segs, k, cbt), bounds[-1]
+        if _DYN_ON and isinstance(layer, ParallelLMHead) and getattr(layer, "exl3_draft", None) is not None:
+            _build_draft_dyn(layer)   # DRAFT-DYN + context bias, DYN2 host path (needs layer.exl3_id)
+        if _CAP_DIR and _cap_key.startswith("mtp."):
+            _CAPTURE[layer.exl3_id] = _cap_key
         if len(groups) > 1 or replaced:   # the per-member (or draft-package) copies replace the fused trellis
             layer.trellis = Parameter(torch.empty(0, dtype=torch.int16, device=layer.trellis.device), requires_grad=False)
 
@@ -546,10 +561,37 @@ _HAD_QUANT = os.environ.get("EXL3_INT8_HAD_QUANT", "1") == "1"
 _HAD_QUANT_MIN = int(os.environ.get("EXL3_INT8_HAD_QUANT_MIN", "2048"))
 
 
+# MTP-H capture: EXL3_CAPTURE_MTP_H=<dir> accumulates X^T X (fp32) of the real inputs of every
+# mtp.* linear and the draft head (one Hessian per fused module: members share the input), for calibrated draft
+# re-quantization of the draft linears. Run the capture engine with --enforce-eager (Python must see every
+# call); saved every EXL3_CAPTURE_EVERY calls of a module and at 3 x that. Not for production.
+_CAP_DIR = os.environ.get("EXL3_CAPTURE_MTP_H")
+_CAP_EVERY = int(os.environ.get("EXL3_CAPTURE_EVERY", "2000"))
+_CAPTURE: dict = {}
+_CAP_H: dict = {}
+
+
+def _capture_h(layer_id, x2):
+    key = _CAPTURE[layer_id]
+    st = _CAP_H.get(key)
+    if st is None:
+        st = _CAP_H[key] = [torch.zeros((x2.shape[1], x2.shape[1]), dtype=torch.float32, device=x2.device), 0, 0]
+    xf = x2.float()
+    st[0].addmm_(xf.t(), xf)
+    st[1] += x2.shape[0]
+    st[2] += 1
+    if st[2] % _CAP_EVERY == 0:
+        os.makedirs(_CAP_DIR, exist_ok=True)
+        torch.save({"H": st[0].cpu(), "count": st[1], "calls": st[2]}, os.path.join(_CAP_DIR, key + ".pt"))
+        logger.info("MTP-H: saved %s (%d rows, %d calls)", key, st[1], st[2])
+
+
 @torch.library.custom_op("exl3cuda::linear", mutates_args=())
 def _linear(x: torch.Tensor, layer_id: int, n: int) -> torch.Tensor:
     shape = x.shape
     x2 = x.reshape(-1, shape[-1])
+    if _CAP_DIR and layer_id in _CAPTURE and not torch.cuda.is_current_stream_capturing():
+        _capture_h(layer_id, x2)
     if not x2.is_contiguous():
         x2 = x2.contiguous()
     if x2.dtype != torch.half:
@@ -575,6 +617,462 @@ def _linear(x: torch.Tensor, layer_id: int, n: int) -> torch.Tensor:
 @_linear.register_fake
 def _(x, layer_id, n):
     return x.new_empty((*x.shape[:-1], n))
+
+
+# ------------------------------------------------------------------------------------------------
+# Pruned-vocabulary draft head for MTP speculative decoding (same logic as the XPU plugin).
+# The drafter proposes tokens from a subset of 128-token blocks (EXL3 lm_head columns can only be
+# sliced by whole 128-column Hadamard blocks); the target still verifies with the full lm_head, so
+# generated text is unchanged. Enabled by EXL3_DRAFT_VOCAB=<draft_vocab.json>.
+
+_DRAFT_FAR_FROM = int(os.environ.get("EXL3_DRAFT_FAR_FROM", "2"))
+
+
+def _spec_is_mtp():
+    try:
+        from vllm.config import get_current_vllm_config
+        sc = get_current_vllm_config().speculative_config
+    except Exception:
+        return True
+    return sc is not None and "mtp" in str(getattr(sc, "method", "")).lower()
+
+
+def _build_draft_head(layer, path, cbt, attr="exl3_draft"):
+    dw = _draft_weights()
+    if dw is not None and "draft_head.trellis" in dw:
+        # EXL3_DRAFT_WEIGHTS: the head's rows were re-quantized on their own (lower bitrate); near and far share it
+        dev = layer.trellis.device
+        cached = getattr(layer, "_exl3_dw_head", None)
+        if cached is None:
+            bs = int(dw["draft_head.block_size"])
+            blocks = dw["draft_head.blocks"].long()
+            idx = (blocks[:, None] * bs + torch.arange(bs)[None, :]).flatten()
+            idx = idx[idx < layer.svh.shape[0]].to(dev)
+            tr = dw["draft_head.trellis"].to(dev)
+            lid = _register([dict(tr=tr, suh=dw["draft_head.suh"].to(dev), svh=dw["draft_head.svh"].to(dev))],
+                            layer.trellis.shape[0] * 16, cbt)
+            cached = layer._exl3_dw_head = dict(id=lid, n=idx.numel(), idx=idx)
+            logger.info("exl3: MTP draft head from EXL3_DRAFT_WEIGHTS: %d rows at %d bpw", idx.numel(), tr.shape[-1] // 16)
+        setattr(layer, attr, cached)
+        return
+    with open(path) as f:
+        spec = json.load(f)
+    blocks = torch.tensor(spec["blocks"], dtype=torch.long)
+    # block_size: tokens per vocab block. Must be a multiple of 128: EXL3 applies the output Hadamard over each 128-column
+    # group, so a subset of a group's columns is not a valid head (tested: 16-token blocks -> 1.3 tok/step)
+    bs = int(spec.get("block_size", 128))
+    assert bs % 128 == 0, "draft vocab: block_size must be a multiple of 128 (EXL3 output Hadamard groups)"
+    n_total_blocks = layer.svh.shape[0] // bs
+    blocks = blocks[blocks < n_total_blocks]
+    if (len(blocks) * bs) % 128:
+        blocks = blocks[: len(blocks) - (len(blocks) * bs % 128) // bs]
+    dev = layer.trellis.device
+    tpb = bs // 16
+    tiles = (blocks[:, None] * tpb + torch.arange(tpb)[None, :]).flatten().to(dev)
+    trellis = layer.trellis.data.index_select(1, tiles).contiguous()
+    svh = layer.svh.data[: n_total_blocks * bs].view(-1, bs).index_select(0, blocks.to(dev)).flatten().contiguous()
+    idx = (blocks[:, None] * bs + torch.arange(bs)[None, :]).flatten().to(dev)
+    lid = _register([dict(tr=trellis, suh=layer.suh.data[0].contiguous(), svh=svh)], layer.trellis.shape[0] * 16, cbt)
+    if _CAP_DIR and attr == "exl3_draft":
+        _CAPTURE[lid] = "draft_head"
+    setattr(layer, attr, dict(id=lid, n=svh.shape[0], idx=idx))
+    logger.info("exl3: MTP draft head (%s) uses %d of %d vocab blocks (%.1f%% of lm_head)",
+                attr, len(blocks), n_total_blocks, 100.0 * len(blocks) / n_total_blocks)
+
+
+_DW = None
+
+
+def _draft_weights():
+    """EXL3_DRAFT_WEIGHTS=<safetensors>: re-quantized MTP linears + draft head (CPU dict; user-supplied)."""
+    global _DW
+    path = os.environ.get("EXL3_DRAFT_WEIGHTS")
+    if not path:
+        return None
+    if _DW is None:
+        from safetensors.torch import load_file
+        _DW = load_file(path)
+        logger.info("exl3: EXL3_DRAFT_WEIGHTS %s (%d tensors)", path, len(_DW))
+    return _DW
+
+
+def _draft_weights_swap(prefix, groups, segs, dev) -> bool:
+    """Replace the segments of an mtp.* linear with the draft package's tensors (one member per group)."""
+    dw = _draft_weights()
+    if dw is None or prefix is None:
+        return False
+    key = _norm_key(prefix)
+    if not key.startswith("mtp."):
+        return False
+    base, leaf = key.rsplit(".", 1)
+    members = FUSED.get(leaf, [leaf])
+    names = [f"{base}.{m}" for m in members]
+    if len(segs) != len(groups) or any(len(g) != 1 for g in groups) and len(groups) > 1:
+        return False
+    if len(groups) == 1 and len(members) > 1:
+        return False                                   # fused in the checkpoint: no per-member draft tensors
+    sel = [names[g[0]] for g in groups] if len(members) > 1 else names
+    if not all(f"{n}.trellis" in dw for n in sel):
+        logger.warning("exl3: EXL3_DRAFT_WEIGHTS has no tensors for %s; keeping the checkpoint's", key)
+        return False
+    for i, n in enumerate(sel):
+        segs[i] = dict(tr=dw[f"{n}.trellis"].to(dev), suh=dw[f"{n}.suh"].to(dev), svh=dw[f"{n}.svh"].to(dev))
+    logger.info("exl3: %s from EXL3_DRAFT_WEIGHTS (%d bpw)", key, segs[0]["tr"].shape[-1] // 16)
+    return True
+
+
+# ------------------------------------------------------------------------------------------------
+# DRAFT-DYN + context bias: port of the XPU plugin's DRAFT-DYN (+4-7% tokens/step on real calls there). Per request and per draft head, up to E extra draft-head rows
+# (the request's most frequent prompt tokens that are not in the static head; near passes E' = EXL3_DRAFT_DYN_NEAR, far
+# passes E = EXL3_DRAFT_DYN) and a +b drafter-logit bias on every prompt token (EXL3_DRAFT_BIAS). Off unless
+# EXL3_DRAFT_DYN > 0 or EXL3_DRAFT_BIAS != 0. Exact: compute_logits returns a full-vocab row and vLLM's draft sampler
+# samples it and returns the probs it sampled from (see draftdyn.py); pads go to virtual columns past the lm_head width.
+# CUDA specifics vs the XPU plugin: rows are int4 g64 on the host (whole lm_head, ~0.7 GB RAM), uploaded only for newly arrived
+# requests into persistent per-request device slots (pinned, non_blocking, on a side stream that first waits for the
+# main stream), dequantized on the device into a batch-ordered fp16 buffer [S, E, K]; the per-pass extra logits are one
+# bmm (row b's own E rows, no B x B*E waste). No host sync: the sampler polls the update's event (cudaEventQuery) and
+# drafts from the static head alone until it is done, or, for an update without uploads (reorder / a request left),
+# makes the main stream wait for it on the GPU. compute_logits runs eagerly (outside the drafter's PIECEWISE graphs);
+# every buffer is persistent and allocated at load (before vLLM sizes the KV cache).
+# DYN2: the per-batch-change host work moved off the step path (8 streams on the 5090 were -13.6% with it).
+# Requests get a persistent slot at admission (after _update_states); one worker thread counts the prompt tokens
+# (incrementally), gathers the int4 rows into pinned staging and, on a side stream after a main-stream event, uploads +
+# dequantizes them into Wslot[slot] and the slot's X/XB/SB rows. propose only polls the waiting rows' events, maps rows
+# to slots (not-yet-uploaded rows -> the NULL slot = static head, exact) and, when the map changed, issues one pinned
+# H2D of the map + index_select gathers into the batch-ordered tables. No host sync, no prompt scan, no pin_memory per
+# step. Per-pass math unchanged (full_logits). See draftdyn.py "DYN2".
+
+def _env_int(name, default):
+    try:
+        return int(os.environ.get(name, "") or default)
+    except ValueError:
+        return int(default)
+
+
+_DYN_E = _env_int("EXL3_DRAFT_DYN", 0)
+_DYN_E_NEAR = _env_int("EXL3_DRAFT_DYN_NEAR", _DYN_E)
+try:
+    _DYN_BETA = float(os.environ.get("EXL3_DRAFT_BIAS", "0") or 0)
+except ValueError:
+    _DYN_BETA = 0.0
+_DYN_GS = _env_int("EXL3_DRAFT_DYN_GS", 64)              # int4 group size of the host rows
+_DYN_ON = max(_DYN_E, _DYN_E_NEAR) > 0 or _DYN_BETA != 0
+_DYN_BG = os.environ.get("EXL3_DRAFT_DYN_BG", "1") != "0"   # DYN2: upload jobs on a worker thread (0 = inline)
+_DYN: dict = {"groups": [], "mgr": None, "hooked": False}
+_DYN_HOST: dict = {}
+
+
+@torch.no_grad()
+def _dyn_host_table(layer, gs):
+    """The whole lm_head as per-row int4 g{gs} rows on the host: (packed [V, K/8] int32, scales [V, G] fp16, zeros
+    [V, G] int8), ~0.7 GB for the 27B. Built from the layer's own LinearEXL3 (identity rows through lm.forward, i.e.
+    the fp16 weights the target uses; not the plugin op, whose INT8_PREFILL branch would int8 the weights), 512 K
+    columns at a time (y [512, V] fp16, ~254 MB transient), quantized on the device in 32k-row chunks. Once per process."""
+    from .draftdyn import quantize_cols_into
+    lin = _SEGS[layer.exl3_id][0]
+    V, K = lin.out_features, lin.in_features
+    key = (V, K, gs, float(layer.svh.data[:4096].float().sum()))
+    if key in _DYN_HOST:
+        return _DYN_HOST[key]
+    import numpy as np
+    G = K // gs
+    hq = np.empty((V, K // 8), dtype=np.int32)
+    hs = np.empty((V, G), dtype=np.float16)
+    hz = np.empty((V, G), dtype=np.int8)
+    dev = lin.trellis.device
+    CH = 512 if K % 512 == 0 else gs
+    for a in range(0, K, CH):
+        eye = torch.zeros(CH, K, dtype=torch.float16, device=dev)
+        eye[torch.arange(CH, device=dev), torch.arange(a, a + CH, device=dev)] = 1
+        y = lin.forward(eye, {})                          # [CH, V] = lm_head[:, a:a + CH]^T
+        for r0 in range(0, V, 32768):
+            r1 = min(V, r0 + 32768)
+            quantize_cols_into(hq[r0:r1], hs[r0:r1], hz[r0:r1], y[:, r0:r1].t().contiguous(), a, gs)
+        del y, eye
+    torch.cuda.empty_cache()
+    table = (hq, hs, hz)
+    _DYN_HOST[key] = table
+    logger.info("exl3: DRAFT-DYN host int4 lm_head: %d x %d, group %d (%.0f MB host)", V, K, gs,
+                sum(x.nbytes for x in table) / 1e6)
+    return table
+
+
+def _build_draft_dyn(layer):
+    """Per-head-dict DYN groups (near and far share one group when they share one head dict, as an
+    EXL3_DRAFT_WEIGHTS head does: E = max of the two, near passes use the first E' columns, which are exactly the E'
+    most frequent: rows are sorted by count then id) and the DYN2 manager with all buffers allocated at load (before
+    vLLM sizes the KV cache)."""
+    from .draftdyn import DynManager, static_pos_map
+    try:
+        from vllm.config import get_current_vllm_config
+        S = int(get_current_vllm_config().scheduler_config.max_num_seqs)
+    except Exception:  # noqa
+        S = 16
+    dev = layer.suh.device
+    K = layer.suh.shape[-1]
+    gs = _DYN_GS
+    G = K // gs
+    base = int(layer.exl3_n)                              # virtual pad columns start at the lm_head width
+    host = _dyn_host_table(layer, gs) if max(_DYN_E, _DYN_E_NEAR) > 0 else None
+    groups: dict = {}
+    for attr, E in (("exl3_draft", _DYN_E_NEAR), ("exl3_draft_far", _DYN_E)):
+        d = getattr(layer, attr, None)
+        if d is None:
+            continue
+        g = groups.get(id(d))
+        if g is None:
+            g = groups[id(d)] = dict(d=d, Es={}, beta=_DYN_BETA, gs=gs, G=G, K=K, base=base)
+        g["Es"][attr] = max(0, E)
+    lim = base
+    for g in groups.values():
+        d = g["d"]
+        E = max(g["Es"].values())
+        ix = d["idx"].cpu()
+        pos = static_pos_map(ix, max(base, int(ix.max()) + 1))
+        lim = min(lim, pos.size)
+        g.update(E=E, Ns=d["idx"].numel(), width=base + E, host=host if E > 0 else None, pos=pos)
+    mgr = DynManager(list(groups.values()), S, dev, lim, bg=_DYN_BG, log=logger)
+    mgr.DELAY_S = _env_int("EXL3_DRAFT_DYN_DELAY_US", 2000) / 1e6
+    mb, pmb = mgr.alloc()
+    for g in groups.values():
+        g["mgr"] = mgr
+        g["d"]["dyn"] = g
+    _DYN["mgr"] = mgr
+    _DYN["groups"] = list(groups.values())
+    _patch_dyn_hook()
+    logger.info("exl3: DRAFT-DYN2 on: near E=%d, far E=%d, bias %.2f, %d slots, %d head group(s), %s uploads "
+                "(%.1f MB device, %.1f MB pinned)", _DYN_E_NEAR, _DYN_E, _DYN_BETA, S, len(groups),
+                "background" if _DYN_BG else "inline", mb, pmb)
+
+
+def _dyn_mgr(runner):
+    """The manager of the lm_head the drafter actually uses (the target's, shared by vLLM)."""
+    m = getattr(getattr(runner, "drafter", None), "model", None)
+    if m is not None and not hasattr(m, "lm_head") and hasattr(m, "unwrap"):
+        m = m.unwrap()
+    lm = getattr(m, "lm_head", None)
+    for attr in ("exl3_draft", "exl3_draft_far"):
+        d = getattr(lm, attr, None) if lm is not None else None
+        g = d.get("dyn") if isinstance(d, dict) else None
+        if g is not None:
+            return g["mgr"]
+    return _DYN.get("mgr")
+
+
+def _dyn_prompt(runner, rid):
+    """A request's prompt tokens without a Python-list conversion: the input batch's numpy row (vLLM copied the prompt
+    there in add_request) when the request is in the batch, else the cached state's list (converted by the worker)."""
+    ib = runner.input_batch
+    i = ib.req_id_to_index.get(rid)
+    if i is not None:
+        n = int(ib.num_prompt_tokens[i])
+        return ib.token_ids_cpu[i, :n].copy()            # ~5 us memcpy at 22k tokens
+    st = runner.requests.get(rid)
+    p = getattr(st, "prompt_token_ids", None) if st is not None else None
+    return list(p) if p is not None else None
+
+
+def _dyn_admit(runner, so):
+    """After _update_states: finished requests free their slots, new (and streaming-updated) requests get a slot and
+    a background job. Host cost: nothing unless the step has new or finished requests."""
+    mgr = _dyn_mgr(runner)
+    if mgr is None or mgr.disabled:
+        return
+    fin = getattr(so, "finished_req_ids", None)
+    new = getattr(so, "scheduled_new_reqs", None)
+    if not fin and not new:
+        return
+    t0 = time.perf_counter_ns()
+    for rid in fin or ():
+        mgr.drop(rid)
+    if new:
+        batch = runner.input_batch.req_id_to_index         # membership only (evictions skip batch rows)
+        for nr in new:
+            rid = getattr(nr, "req_id", None)
+            if rid is not None:
+                mgr.admit(rid, _dyn_prompt(runner, rid), batch)
+    if len(mgr.req) > 4 * mgr.S:                          # safety sweep (requests that left without a finish event)
+        for rid in [r for r in mgr.req if r not in runner.requests]:
+            mgr.drop(rid)
+    st = mgr.st
+    dt = time.perf_counter_ns() - t0
+    st["adm_ns"] = st.get("adm_ns", 0) + dt
+    st["adm"] = st.get("adm", 0) + 1
+    st["adm_max"] = max(st.get("adm_max", 0), dt)
+
+
+def _dyn_step(runner):
+    """Start of every propose_draft_token_ids: per-row activation + the row -> slot gather when the map changed."""
+    mgr = _dyn_mgr(runner)
+    if mgr is None or mgr.disabled or torch.cuda.is_current_stream_capturing():
+        return
+    t0 = time.perf_counter_ns()
+    ib = runner.input_batch
+    rids = ib.req_ids
+    n = len(ib.req_id_to_index)
+    if len(rids) != n:
+        rids = rids[:n]
+    chg0 = mgr.st["chg"]
+    mgr.step(rids, lambda rid: _dyn_prompt(runner, rid))
+    dt = time.perf_counter_ns() - t0
+    st = mgr.st
+    st["calls"] += 1
+    st["hook_ns"] += dt
+    st["hook_max"] = max(st["hook_max"], dt)
+    if st["chg"] != chg0:
+        st["chg_ns"] += dt
+        st["chg_max"] = max(st["chg_max"], dt)
+
+
+def _dyn_count(mgr, kind):
+    st = mgr.st
+    st[kind] += 1
+    st["n"] += 1
+    if st["n"] % 5000 == 0:
+        c = max(1, st["chg"])
+        logger.info("exl3: DRAFT-DYN2 last 5000 draft passes: %d with DYN, %d static; %d batch changes (host %.1f us "
+                    "mean, %.1f max), %d regathers (%d rows), hook %.1f us mean over %d calls; %d uploads (%d activated, "
+                    "%d stale, %d failed, worker %.2f ms mean), admission %.1f us mean / %.1f max; %d rows waiting",
+                    st["dyn"], st["skip"], st["chg"], st["chg_ns"] / c / 1e3, st["chg_max"] / 1e3, st["gat"],
+                    st["grow"], st["hook_ns"] / max(1, st["calls"]) / 1e3, st["calls"], st["upl"], st["act"],
+                    st["stale"], st["fail"], st["job_ns"] / max(1, st["jobs"]) / 1e6,
+                    st.get("adm_ns", 0) / max(1, st.get("adm", 0)) / 1e3, st.get("adm_max", 0) / 1e3, mgr.waiting)
+        for k in list(st):
+            st[k] = 0
+
+
+def _dyn_draft_row(d, attr, sub, h, width, vocab):
+    """compute_logits hook: the full-vocab draft row with each row's extra rows + bias (rows whose upload is not done
+    map to the NULL slot = the static head), or None (static head for the whole pass)."""
+    g = d.get("dyn")
+    if g is None:
+        return None
+    mgr = g["mgr"]
+    B = h.shape[0]
+    if not mgr.any or mgr.B != B or torch.cuda.is_current_stream_capturing():
+        _dyn_count(mgr, "skip")
+        return None
+    Ep = g["Es"].get(attr, g["Es"].get("exl3_draft", 0))
+    SB = g["SB"][:B] if g["beta"] else None
+    if Ep <= 0 and SB is None:
+        return None
+    _dyn_count(mgr, "dyn")
+    from .draftdyn import full_logits
+    if Ep <= 0:
+        return full_logits(sub, d["idx"], width, vocab, SB=SB)
+    return full_logits(sub, d["idx"], g["width"], vocab, h=h, W=g["Wb"][:B, :Ep], Xs=g["Xs"][:B, :Ep],
+                       XB=g["XB"][:B, :Ep], SB=SB)
+
+
+def _dyn_fail(where, e):
+    logger.warning("exl3: DRAFT-DYN2 %s failed (%r); static heads only from now on", where, e)
+    mgr = _DYN.get("mgr")
+    if mgr is not None:
+        mgr.reset()
+
+
+def _patch_dyn_hook():
+    if _DYN["hooked"]:
+        return
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner as R
+    orig = R.propose_draft_token_ids
+
+    def propose_draft_token_ids(self, *a, **k):
+        try:
+            _dyn_step(self)
+        except Exception as e:  # noqa
+            _dyn_fail("batch update", e)
+            R.propose_draft_token_ids = orig
+        return orig(self, *a, **k)
+
+    R.propose_draft_token_ids = propose_draft_token_ids
+    orig_us = getattr(R, "_update_states", None)
+    if orig_us is not None:
+        def _update_states(self, scheduler_output, *a, **k):
+            out = orig_us(self, scheduler_output, *a, **k)
+            try:
+                _dyn_admit(self, scheduler_output)
+            except Exception as e:  # noqa
+                _dyn_fail("admission", e)
+                R._update_states = orig_us
+            return out
+
+        R._update_states = _update_states
+    _DYN["hooked"] = True
+    logger.info("exl3: DRAFT-DYN2 batch hook installed (DYN %d, near %d, bias %s, admission hook %s)", _DYN_E,
+                _DYN_E_NEAR, _DYN_BETA, "on" if orig_us is not None else "off (first-propose fallback)")
+
+
+def _patch_mtp_draft_logits():
+    try:
+        from vllm.model_executor.models import qwen3_5_mtp
+    except Exception:
+        return
+    cls = qwen3_5_mtp.Qwen3_5MTP
+    if getattr(cls, "_exl3_patched", False):
+        return
+    orig = cls.compute_logits
+
+    def compute_logits(self, hidden_states, spec_step_idx: int = 0):
+        lm = self.lm_head
+        d = getattr(lm, "exl3_draft", None)
+        if d is None:
+            return orig(self, hidden_states, spec_step_idx)
+        far = getattr(lm, "exl3_draft_far", None)
+        attr = "exl3_draft"
+        if far is not None:
+            k = getattr(self, "_exl3_pass", 0)
+            self._exl3_pass = k + 1
+            if k >= _DRAFT_FAR_FROM:
+                d = far
+                attr = "exl3_draft_far"
+        sub = torch.ops.exl3cuda.linear(hidden_states, d["id"], d["n"])
+        if _DYN_ON:                                       # DYN2: None = this pass drafts from the static head
+            r = _dyn_draft_row(d, attr, sub, hidden_states, lm.exl3_n, self.config.vocab_size)
+            if r is not None:
+                return r
+        logits = hidden_states.new_full((hidden_states.shape[0], lm.exl3_n), float("-inf"))
+        logits.index_copy_(1, d["idx"], sub)
+        return logits[:, : self.config.vocab_size]
+
+    cls.compute_logits = compute_logits
+    cls._exl3_patched = True
+    # DRAFT-WINDOW: EXL3_DRAFT_WINDOW=W gives the MTP layer's attention a sliding window of the
+    # last W tokens at decode (the impl's window; KV layout unchanged). Drafts only: the target verifies every token, so
+    # outputs stay exact; the MTP layer also gets the target's hidden state, which carries the long context. Saves the
+    # draft passes' full-context KV reads (~60 us per pass at 20k tokens on the 5090).
+    _dwin = int(os.environ.get("EXL3_DRAFT_WINDOW", "0"))
+    if _dwin > 0:
+        _orig_lw = cls.load_weights
+
+        def load_weights(self, *args, **kwargs):
+            r = _orig_lw(self, *args, **kwargs)
+            n = 0
+            for mod in self.modules():
+                impl = getattr(mod, "impl", None)
+                if impl is not None and hasattr(impl, "sliding_window"):
+                    impl.sliding_window = (_dwin - 1, 0)
+                    n += 1
+            logger.info("exl3: DRAFT-WINDOW: %d MTP attention layer(s) limited to the last %d tokens", n, _dwin)
+            return r
+
+        cls.load_weights = load_weights
+    if os.environ.get("EXL3_DRAFT_VOCAB_FAR"):
+        try:
+            from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer as _P
+            _orig_propose = _P.propose
+
+            def propose(self, *args, **kwargs):
+                try:
+                    self.model._exl3_pass = 0
+                except Exception:
+                    pass
+                return _orig_propose(self, *args, **kwargs)
+
+            _P.propose = propose
+            logger.info("exl3: graded draft vocab: far head from draft position %d", _DRAFT_FAR_FROM)
+        except Exception as e:  # noqa
+            logger.warning("exl3: graded draft vocab not installed (%s)", e)
 
 
 # ------------------------------------------------------------------------------------------------
@@ -1427,4 +1925,6 @@ def register():
     _patch_gdn_recompute()
     _patch_int8kv_fa()
     _patch_kvw4()
+    if os.environ.get("EXL3_DRAFT_VOCAB"):
+        _patch_mtp_draft_logits()
     return None
