@@ -13,6 +13,26 @@ stock path in place. Some features need companion patches to vLLM itself (noted 
     pip install ./exl3cuda                     # after building the kernels you want (see below)
     vllm serve <EXL3 checkpoint dir> ...       # quant_method "exl3" in its config.json selects the plugin
 
+## Scope: kernels here, memory policy in AllBroker
+
+This package is the fast math: quantized linears, attention (int8 / int4 KV), GDN, speculative-decoding and sampling
+kernels, and the plugin that registers them with vLLM. It does not decide what stays in GPU memory. That is the memory
+layer, [AllBroker](https://github.com/echowarp/AllBroker) (`llmt_kv` package):
+
+| Memory-policy piece | Where it lives | What this package keeps |
+|---|---|---|
+| Weight keeper (weights stay resident across engine restarts) | AllBroker `llmt-keeper` daemon + engine-side loader `whx_loader` | two loader callbacks only: `whx_registry(model)` (the EXL3 linears' tensors by module name) and `whx_finish(model)` (rebuild the kernel objects from held tensors after an attach). Off unless `EXL3_WHX` is set; the loader module comes from `EXL3_WHX_MODULE` (default `llmt_kv.whx_loader`) |
+| No-mmap safetensors loader | AllBroker `llmt_kv.nommap_loader` | nothing; used when `llmt_kv` is installed, else vLLM's loader |
+| KV lending, LoRA / vision / prefill scratch, RAM KV tier | AllBroker (`llmt_kv`, vLLM plugin + connector) | LoRA kernels only (none here yet for CUDA) |
+| Lazy vision tower | AllBroker's broker-managed version (VRAM budget shared with KV lending) | `llmt_lazyvis.py`: the standalone device-only version production runs today (`EXL3_LAZY_VISION`). Kept for compatibility; with AllBroker installed, use its module instead (do not enable both) |
+
+GPU-specific settings are configuration, not code: every feature is an `EXL3_*` variable (table below), and the
+production values are listed per variable. Kernel libraries are found next to the package (`exl3cuda/lib/`) unless a
+variable names another path.
+
+CPU-only checks (no GPU, no kernels built): `python -m pytest -q exl3cuda/tests/test_cpu_plugin.py` (plugin import,
+entry point, keeper-loader resolution, defaults). Kernel tests need an sm_120 GPU.
+
 ## Layout
 
 | Path (under `exl3cuda/`) | What |
@@ -56,7 +76,7 @@ Production = the Qwen3.8-27B RTX 5090 service (int4_per_token_head KV, MTP k = 7
 | `EXL3_KV_BLOCK_ALIGN` | default (64) | KV-BLOCK-ALIGN: attention block size of the hybrid GDN model rounded up to a multiple of this (same blocks as the XPU plugin) |
 | `EXL3_NOMMAP_LOAD` | default (1) | weight loading without mmap through `llmt_kv.nommap_loader` (skipped when `llmt_kv` is not installed) |
 | `EXL3_GRAPH_DUMP` | unset | diagnosis: dump every captured CUDA graph as .dot to /root/.cache/graph-dump/ |
-| `EXL3_WHX` | unset | optional external weight-keeper loader (module `exl3cuda.whx_loader`, not part of this package) |
+| `EXL3_WHX` | unset | optional weight-keeper loader (AllBroker; module from `EXL3_WHX_MODULE`, default `llmt_kv.whx_loader`, then `exl3cuda.whx_loader`, then `whx_loader`); uses the `whx_registry` / `whx_finish` callbacks |
 | `EXL3_GDN_RECOMPUTE` | 1 | GDN recompute: MTP spec decoding with one committed SSM state per request (no 1 + k state pages); needs the companion vLLM gpu_model_runner hooks |
 | `EXL3_GDN_RC_SLOTS` | default (16) | GDN recompute pending-pool slots |
 | `EXL3_RC_FUSED_IN` | 1 | RC-FUSED-IN: q/k/v split, gating and output write inside the recompute kernel |

@@ -2346,6 +2346,22 @@ def _patch_kvw4():
     i4m.reshape_and_cache_int4 = reshape_and_cache_int4
 
 
+def _import_whx_loader():
+    """The weight keeper's engine-side loader lives in AllBroker (memory policy is not part of this package).
+    EXL3_WHX_MODULE names it; default: llmt_kv.whx_loader, then a whx_loader module next to this package, then a
+    top-level whx_loader."""
+    import importlib
+    names = [os.environ["EXL3_WHX_MODULE"]] if os.environ.get("EXL3_WHX_MODULE") else [
+        "llmt_kv.whx_loader", __package__ + ".whx_loader", "whx_loader"]
+    err = None
+    for n in names:
+        try:
+            return importlib.import_module(n)
+        except ImportError as e:
+            err = e
+    raise err
+
+
 def register():
     """vllm.general_plugins entry point (runs in every vLLM process)."""
     _patch_graph_dump()
@@ -2358,9 +2374,9 @@ def register():
         logger.info("nommap_loader not installed (llmt_kv missing); using vLLM's safetensors loader")
     except Exception as e:  # noqa: never block engine start; vLLM's own loader stays in place
         logger.warning("nommap_loader not active (%s: %s); using vLLM's safetensors loader", type(e).__name__, e)
-    if os.environ.get("EXL3_WHX"):            # optional weight-keeper loader (module whx_loader, not part of this package)
+    if os.environ.get("EXL3_WHX"):            # optional weight-keeper loader (AllBroker; not part of this package)
         try:
-            from . import whx_loader
+            whx_loader = _import_whx_loader()
             whx_loader.install()
         except Exception as e:  # noqa: never block engine start; weights load from disk
             logger.warning("exl3: WHX not active (%s: %s)", type(e).__name__, e)
