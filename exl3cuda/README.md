@@ -108,7 +108,7 @@ needs a data file or a companion change outside this package).
 | `EXL3_NOMMAP_LOAD` | 1 | weight loading without mmap through `llmt_kv.nommap_loader` (skipped when `llmt_kv` is not installed) |
 | `EXL3_GRAPH_DUMP` | unset | diagnosis: dump every captured CUDA graph as .dot to /root/.cache/graph-dump/ |
 | `EXL3_WHX` | unset | optional weight-keeper loader (AllBroker; module from `EXL3_WHX_MODULE`, default `llmt_kv.whx_loader`, then `exl3cuda.whx_loader`, then `whx_loader`); uses the `whx_registry` / `whx_finish` callbacks |
-| `EXL3_GDN_RECOMPUTE` | 0 (ref: 1) | GDN recompute: MTP spec decoding with one committed SSM state per request (no 1 + k state pages); needs the companion vLLM gpu_model_runner hooks (checked: without them it logs and stays off) |
+| `EXL3_GDN_RECOMPUTE` | 1 (sm_120), else 0 | GDN recompute: MTP spec decoding with one committed SSM state per request (no 1 + k state pages); needs the companion vLLM gpu_model_runner hooks, which follow the plugin's switch (checked: without them it logs and stays off) |
 | `EXL3_GDN_RC_SLOTS` | 16 | GDN recompute pending-pool slots |
 | `EXL3_RC_FUSED_IN` | 1 (sm_120), else 0 | RC-FUSED-IN: q/k/v split, gating and output write inside the recompute kernel |
 | `EXL3_RC_SLICE` | 1 (sm_120), else 0 | RC-SLICE: mixed steps use views for the non-spec rows instead of gather/scatter (bit-identical) |

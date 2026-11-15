@@ -132,7 +132,7 @@ def test_hw_defaults_off_without_sm120(plugin):
     for name in ("EXL3_FUSE_DECODE", "EXL3_INT8_PREFILL", "EXL3_FA16", "EXL3_DRAFT_DYN"):
         os.environ.pop(name, None)
     assert plugin.FUSE_DECODE is False and plugin.INT8_PREFILL is False and plugin.FUSE_MAX_M == 16
-    assert plugin._FA16_V == "" and plugin._DYN_E == 0 and plugin._DYN_E_NEAR == 0
+    assert plugin._FA16_V == "" and plugin._DYN_E == 0 and plugin._DYN_E_NEAR == 0 and plugin.GDN_RC["on"] is False
     assert hwdefaults.device_ok() is False
 
 

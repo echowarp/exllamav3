@@ -1880,8 +1880,9 @@ def _patch_int8kv_fa():
 # for the 48 GDN layers with ONE committed SSM state per request
 # (Triton kernel exl3cuda.gdn_rc.gdn_recompute), so MambaSpec.num_speculative_blocks = 0 and a running request no
 # longer reserves 1 + k state pages per GDN group. The runner-side bookkeeping (pool slot / parity / pending count /
-# decode-time boundary states) is in the patched vLLM gpu_model_runner.py (_llmt_gdn_rc). EXL3_GDN_RECOMPUTE=1.
-GDN_RC = {"on": os.environ.get("EXL3_GDN_RECOMPUTE", "0") == "1", "S": int(os.environ.get("EXL3_GDN_RC_SLOTS", "16"))}
+# decode-time boundary states) is in the patched vLLM gpu_model_runner.py (_llmt_gdn_rc), which follows GDN_RC["on"].
+# EXL3_GDN_RECOMPUTE=1 / 0; unset = on with an sm_120 GPU. Off (warning) when either half cannot install.
+GDN_RC = {"on": _hwenv("EXL3_GDN_RECOMPUTE", "1", "0") == "1", "S": int(os.environ.get("EXL3_GDN_RC_SLOTS", "16"))}
 
 
 def _rc_alloc_all(static_forward_context, device):
@@ -1926,6 +1927,7 @@ def _patch_gdn_recompute():
         from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn as qg
     except Exception as e:  # noqa
         logger.warning("exl3: GDN recompute not installed (%s)", e)
+        GDN_RC["on"] = False                          # the runner reads this flag (vLLM gpu_model_runner._gdn_rc_on)
         return
     if getattr(mabs.MambaBase, "_exl3_rc", False):
         return
