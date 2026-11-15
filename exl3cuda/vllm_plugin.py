@@ -1936,7 +1936,11 @@ def _patch_gdn_recompute():
 
     def get_kv_cache_spec(self, vllm_config):
         spec = orig_spec(self, vllm_config)
-        if isinstance(spec, MambaSpec) and spec.num_speculative_blocks:
+        if (GDN_RC["on"] and os.environ.get("EXL3_GDN_RECOMPUTE") is None
+                and getattr(getattr(vllm_config, "model_config", None), "quantization", None) != "exl3"):
+            GDN_RC["on"] = False      # the default applies to EXL3 models only; the vLLM runner follows this flag
+            logger.info("exl3: GDN recompute off (not an EXL3 model; EXL3_GDN_RECOMPUTE=1 forces it)")
+        if GDN_RC["on"] and isinstance(spec, MambaSpec) and spec.num_speculative_blocks:
             GDN_RC["T1"] = spec.num_speculative_blocks + 1
             spec = dataclasses.replace(spec, num_speculative_blocks=0)
         return spec
@@ -1944,10 +1948,18 @@ def _patch_gdn_recompute():
     mabs.MambaBase._exl3_rc = True
 
     # 2. block-crossing SSM copy takes the committed state (no accept bias); same function object (identity checks)
+    #    The new code runs with mamba_utils' globals: the switch and the original body are put there.
+    import types as _types
+    _t = mmu.get_temporal_copy_spec
+    mmu._exl3_rc_state = GDN_RC
+    mmu._exl3_temporal_orig = _types.FunctionType(_t.__code__, _t.__globals__, "_orig", _t.__defaults__, _t.__closure__)
+
     def _temporal(state, block_ids, cur_block_idx, num_accepted_tokens):
+        if not _exl3_rc_state["on"]:  # noqa: F821 (mamba_utils global)
+            return _exl3_temporal_orig(state, block_ids, cur_block_idx, num_accepted_tokens)  # noqa: F821
         src_state = state[block_ids[cur_block_idx]]
         return MambaCopySpec(start_addr=src_state.data_ptr(), num_elements=src_state.numel())
-    mmu.get_temporal_copy_spec.__code__ = _temporal.__code__
+    _t.__code__ = _temporal.__code__
 
     # 3. fused postprocess: no SSM copies (the kernel stores decode-time boundary states itself)
     orig_init = wmu.MambaSpecDecodeGPUContext.initialize_from_forward_context
@@ -1955,7 +1967,7 @@ def _patch_gdn_recompute():
     def initialize_from_forward_context(self, *a, **kw):
         was = self.is_initialized
         orig_init(self, *a, **kw)
-        if not was:
+        if not was and GDN_RC["on"]:
             self.state_inner_sizes.masked_fill_(self.state_conv_widths == 0, 0)
             logger.info("exl3: GDN recompute: postprocess SSM copies disabled")
     wmu.MambaSpecDecodeGPUContext.initialize_from_forward_context = initialize_from_forward_context
@@ -1969,7 +1981,7 @@ def _patch_gdn_recompute():
         fc = get_forward_context()
         md_all = fc.attn_metadata
         md = md_all.get(self.prefix) if isinstance(md_all, dict) else None
-        if (md is None or md.spec_sequence_masks is None or int(md.num_spec_decodes or 0) == 0
+        if (not GDN_RC["on"] or md is None or md.spec_sequence_masks is None or int(md.num_spec_decodes or 0) == 0
                 or "buf" not in GDN_RC or not hasattr(self, "_exl3_pool")):
             return orig_core(self, mixed_qkv, b, a, core_attn_out)
         return _rc_forward(self, orig_core, md, md_all, mixed_qkv, b, a, core_attn_out)
