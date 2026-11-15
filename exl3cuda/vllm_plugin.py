@@ -1906,6 +1906,17 @@ GDN_RC["alloc"] = _rc_alloc_all
 def _patch_gdn_recompute():
     if not GDN_RC["on"]:
         return
+    try:                                              # needs the companion vLLM runner (GDN-RC bookkeeping)
+        import importlib.util
+        _o = importlib.util.find_spec("vllm.v1.worker.gpu_model_runner").origin
+        with open(_o) as _f:
+            _patched = "_llmt_gdn_rc" in _f.read()
+    except Exception:  # noqa
+        _patched = False
+    if not _patched:
+        logger.warning("exl3: GDN recompute needs the companion vLLM gpu_model_runner (_llmt_gdn_rc); not installed")
+        GDN_RC["on"] = False
+        return
     import dataclasses
     try:
         from vllm.model_executor.layers.mamba import abstract as mabs

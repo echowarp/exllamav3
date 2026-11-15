@@ -161,3 +161,16 @@ def test_reference_defaults_match_int4_env():
             m = re.match(r"(EXL3_[A-Z0-9_]+)=(.*)$", line)
             if m and m.group(1) in ref:
                 assert ref[m.group(1)] == m.group(2), (name, line)
+
+
+def test_gdn_recompute_needs_companion_runner(plugin, monkeypatch):
+    """GDN recompute with a vLLM whose gpu_model_runner lacks the _llmt_gdn_rc bookkeeping: warning, stays off."""
+    import importlib.util as iu
+    real = iu.find_spec
+
+    class _Spec:
+        origin = os.path.join(ROOT, "__init__.py")          # any file without the marker
+    monkeypatch.setattr(iu, "find_spec", lambda n, *a, **k: _Spec() if n == "vllm.v1.worker.gpu_model_runner" else real(n, *a, **k))
+    monkeypatch.setitem(plugin.GDN_RC, "on", True)
+    plugin._patch_gdn_recompute()
+    assert plugin.GDN_RC["on"] is False
