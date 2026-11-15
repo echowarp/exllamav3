@@ -174,3 +174,30 @@ def test_gdn_recompute_needs_companion_runner(plugin, monkeypatch):
     monkeypatch.setitem(plugin.GDN_RC, "on", True)
     plugin._patch_gdn_recompute()
     assert plugin.GDN_RC["on"] is False
+
+
+def test_lazyvis_defers_to_allbroker():
+    """With AllBroker's llmt_kv plugin installed, the standalone lazy tower does not install a second time."""
+    import importlib.metadata as md
+    old_env, old_ep = os.environ.get("EXL3_LAZY_VISION"), md.entry_points
+    os.environ["EXL3_LAZY_VISION"] = "1"
+    try:
+        spec = importlib.util.spec_from_file_location("lazyvis_defer_t", os.path.join(ROOT, "llmt_lazyvis.py"))
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        md.entry_points = lambda group=None: [types.SimpleNamespace(value="llmt_kv.plugin:register")]
+        assert m._allbroker_lazyvis() is True
+        m.install()                                   # returns before touching vLLM's loader
+        assert m._STATE["installed"] is True and not m._STATE.get("towers")
+        os.environ["LLMT_KV_PLUGIN"] = "0"
+        assert m._allbroker_lazyvis() is False
+        md.entry_points = lambda group=None: []
+        os.environ.pop("LLMT_KV_PLUGIN")
+        assert m._allbroker_lazyvis() is False
+    finally:
+        md.entry_points = old_ep
+        os.environ.pop("LLMT_KV_PLUGIN", None)
+        if old_env is None:
+            os.environ.pop("EXL3_LAZY_VISION", None)
+        else:
+            os.environ["EXL3_LAZY_VISION"] = old_env

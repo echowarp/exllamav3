@@ -245,11 +245,26 @@ def _offload(model, early):
             threading.Thread(target=_reaper, name="lazyvis-reaper", daemon=True).start()
 
 
+def _allbroker_lazyvis():
+    """True when AllBroker's llmt_kv vLLM plugin is installed (and not switched off): its llmt_kv.lazyvis then manages
+    the tower for EXL3_LAZY_VISION=1, and this standalone copy must not wrap the same loader points a second time."""
+    if _ENV("LLMT_KV_PLUGIN", "1") == "0":
+        return False
+    try:
+        from importlib.metadata import entry_points
+        return any(ep.value.startswith("llmt_kv.") for ep in entry_points(group="vllm.general_plugins"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def install():
     """Called from the patched vllm/model_executor/models/qwen3_vl.py at import (worker process, before weights load)."""
     if not ON or _STATE.get("installed"):
         return
     _STATE["installed"] = True
+    if _allbroker_lazyvis():
+        _log("AllBroker's llmt_kv.lazyvis is installed and manages the tower; standalone copy not installed")
+        return
     import vllm.model_executor.model_loader.base_loader as bl
     orig_pwal = bl.process_weights_after_loading
 
