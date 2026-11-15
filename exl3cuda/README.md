@@ -88,6 +88,19 @@ service: int4_per_token_head KV, MTP k = 7). "a (sm_120), else b" = a when the f
 even an empty one, always wins. "ref: x" = the reference build sets x but the code default stays off (the feature
 needs a data file or a companion change outside this package).
 
+**Scope of the defaults.** The EXL3 linears only serve EXL3 checkpoints, but the attention, KV-write, GDN and
+sampling patches are installed for the whole vLLM process: with exl3cuda installed on an sm_120 GPU they are on by
+default for any model whose layers match their shape checks (fp16, 24 query / 4 KV heads, head size 256 for VA /
+VA4 / KVW4 / I8FA / FA16; Qwen gated-delta-net layers for GDN-PORT / GDN-FAST / TAIL-FUSE conv), and anything else
+takes vLLM's path. GDN recompute is the exception: by default it is on for EXL3 models only. To serve another model
+with stock vLLM behaviour in such an environment, turn them off (or uninstall the package):
+
+    EXL3_VA=0 EXL3_KVW4=0 EXL3_FA16= EXL3_I8FA=0 EXL3_INT8KV_FA=0 EXL3_GDN_PORT=0 EXL3_GDN_FAST=0 \
+    EXL3_TAIL_FUSE=0 EXL3_DYN_SD_FULL=0 EXL3_UNIFORM_SPEC=0 EXL3_MIX3D=0
+
+(`EXL3_INT8KV_FA=0` also switches off VA, VA4 and I4FA; FUSE / INT8_PREFILL / L2SPLIT / DRAFT_DYN act on EXL3
+linears and the EXL3 draft head only.)
+
 | Variable | Default | What it does |
 |---|---|---|
 | `EXL3_INT8_FUSED_MAX_M` | 512 | fused_kernels.fused_linear: F1 (fused decode + GEMM) up to this many rows, F2 above |
