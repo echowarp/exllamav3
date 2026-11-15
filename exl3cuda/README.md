@@ -62,7 +62,7 @@ to build, and our measurements.
 
 | Mode | File | vLLM flag | Kernels to build | Measured (RTX 5090, Qwen3.8-27B EXL3 4.0 bpw) |
 |---|---|---|---|---|
-| int4 KV (production) | `configs/int4.env` | `--kv-cache-dtype int4_per_token_head` | `csrc/va`, `csrc/va4`, `csrc/kvw4`, `csrc/fa16` | 1.88x the int8 KV capacity; long-context decode +14-16 %; KL vs fp16 KV 0.0044 (+0.0031 vs int8); 3,200-token prefix blocks |
+| int4 KV (production) | `configs/int4.env` | `--kv-cache-dtype int4_per_token_head` | `csrc/va`, `csrc/va4` (`-DHPV -DLZT=0.f`), `csrc/kvw4`, `csrc/fa16` | 1.88x the int8 KV capacity; long-context decode +14-16 %; KL vs fp16 KV 0.0044 (+0.0031 vs int8); 3,200-token prefix blocks |
 | int8 KV | `configs/int8.env` | `--kv-cache-dtype int8_per_token_head` | `csrc/va`, `csrc/fa16`, `csrc/i8fa` | KL vs fp16 KV 0.0013; 1,664-token prefix blocks |
 
 Both also need `--attention-backend TRITON_ATTN --dtype float16`. The kernels are specialised for Qwen3.8-27B's
@@ -183,7 +183,8 @@ One nvcc needs ~12 GB RAM (`MAX_JOBS=1`); `build-seq.sh fa_f:1:2 fa_b:1:0` build
 
 ### VA4 and KVW4 (`csrc/va4`, `csrc/kvw4`)
 
-    python3 exl3cuda/csrc/va4/build.py       # -> lib/va4c.so (torch.ops.va4c); extra nvcc flags are passed through
+    python3 exl3cuda/csrc/va4/build.py -DHPV -DLZT=0.f   # -> lib/va4c.so (torch.ops.va4c); production / measured build
+                                             # (fp16-accumulate P.V); without flags: fp32 P.V with lazy rescale
     python3 exl3cuda/csrc/kvw4/build.py      # -> lib/kvw4.so (torch.ops.kvw4)
 
 ### GDN chunk (`csrc/gdnchunk`)
