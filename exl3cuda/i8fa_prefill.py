@@ -20,8 +20,10 @@ import logging
 
 import torch
 
+from exl3cuda.hwdefaults import env as _hwenv
+
 logger = logging.getLogger("vllm")
-_ON = os.environ.get("EXL3_I8FA", "0") == "1"
+_ON = _hwenv("EXL3_I8FA", "1", "0") == "1"
 _DIR = os.environ.get("EXL3_I8FA_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib"))
 _PAGED_ENV = os.environ.get("EXL3_I8FA_PAGED_MAXQ", "auto").strip().lower() or "auto"
 _PAGED_AUTO = _PAGED_ENV == "auto"

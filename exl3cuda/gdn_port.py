@@ -1,5 +1,6 @@
 """GDN-PORT: GDN prefill through the Magnitude WY port (csrc/gdnchunk/gdn_chunk.cu)
-instead of vLLM's causal_conv1d_fn + fused_post_conv_prep + FLA chunk_gated_delta_rule. EXL3_GDN_PORT=1.
+instead of vLLM's causal_conv1d_fn + fused_post_conv_prep + FLA chunk_gated_delta_rule. EXL3_GDN_PORT=1 (default on
+sm_120, see hwdefaults.py; 0 = FLA).
 
 Why (kernel benchmark, RTX 5090):
 - more accurate vs fp64: out rel-RMS 4.3e-4 vs FLA 6.9e-4; state 2.9e-4 vs 6.2e-4;
@@ -130,6 +131,9 @@ def _run(layer, md, mixed_qkv, b, a, core_attn_out):
 def install():
     from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn as qg
     from vllm.v1.attention.backends import gdn_attn as ga
+    from .hwdefaults import sm120
+    if not sm120():
+        raise RuntimeError("GDN-PORT needs an sm_120 GPU (csrc/gdnchunk is an sm_120 build)")
     _ext()                                             # fail at start, not mid-request
     cls_b = ga.GDNAttentionMetadataBuilder
     if getattr(cls_b, "_llmt_port", False):

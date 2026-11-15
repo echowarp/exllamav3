@@ -23,6 +23,7 @@ import torch
 from torch.nn import Parameter
 
 from vllm.logger import init_logger
+from .hwdefaults import env as _hwenv, sm120 as _sm120, device_ok as _device_ok
 from vllm.model_executor.layers.linear import LinearBase, LinearMethodBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization import register_quantization_config
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -475,15 +476,15 @@ def whx_finish(model):
 # as one grid, so the per-launch ramp/tail (~8-10 us at these sizes on the 5090) is paid once. Same math as the
 # per-member path (fp16 output rounding may differ in the last bit). EXL3_FUSE_DECODE=1, rows <= EXL3_FUSE_MAX_M,
 # slice width EXL3_FUSE_WIDTH (0 = gcd of the member widths).
-FUSE_DECODE = os.environ.get("EXL3_FUSE_DECODE", "0") == "1"
-FUSE_MAX_M = int(os.environ.get("EXL3_FUSE_MAX_M", "16"))
+FUSE_DECODE = _hwenv("EXL3_FUSE_DECODE", "1", "0") == "1"
+FUSE_MAX_M = int(_hwenv("EXL3_FUSE_MAX_M", "64", "16"))
 FUSE_WIDTH = int(os.environ.get("EXL3_FUSE_WIDTH", "0"))
 _FUSED: dict = {}
 # FUSE-SCRATCH: for m > 1 the member blocks are scratch until the torch.cat, so all fused modules
 # share one persistent scratch buffer and precomputed output-pointer tables; this drops the per-call `coff[m] + ptr`
 # device add (133 single-block launches per 1-stream step). Calls run in stream order, the cat copies out before the
 # next module writes. EXL3_FUSE_SCRATCH=1 enables.
-FUSE_SCRATCH = os.environ.get("EXL3_FUSE_SCRATCH", "0") == "1"
+FUSE_SCRATCH = _hwenv("EXL3_FUSE_SCRATCH", "1", "0") == "1"
 _FUSE_SCRATCH_ELEMS = 65536 * 16
 _SCRATCH: dict = {}
 
@@ -559,7 +560,7 @@ class _Sliced:
 # rows, GEMM in int8 on the tensor cores instead of fp16. Activations are rotated into the Hadamard basis (no outliers)
 # and quantized per token; the reconstructed rotated-basis weights are quantized per output column with scales computed
 # once (weights are static). Then int32 accumulate (torch._int_mm = cuBLASLt IMMA), rescale, output Hadamard.
-INT8_PREFILL = os.environ.get("EXL3_INT8_PREFILL", "0") == "1"
+INT8_PREFILL = _hwenv("EXL3_INT8_PREFILL", "1", "0") == "1"
 INT8_MIN_ROWS = int(os.environ.get("EXL3_INT8_MIN_ROWS", "256"))
 SLICE_N = int(os.environ.get("EXL3_RECON_SLICE_N", "16384"))
 _WBUF: dict = {}
@@ -639,7 +640,7 @@ def _int8_linear(lin, x, y=None):
 
 
 _HAD_EPI = os.environ.get("EXL3_INT8_HAD_EPI", "1") == "1"
-_L2SPLIT = os.environ.get("EXL3_INT8_L2SPLIT", "0") == "1"
+_L2SPLIT = _hwenv("EXL3_INT8_L2SPLIT", "1", "0") == "1"
 _L2_BUDGET = int(os.environ.get("EXL3_INT8_L2_BUDGET_MB", "64")) << 20
 # EXL3_INT8_HAD_QUANT=1 (default): fused input Hadamard + activation quant (int8_kernels.had_quant) for chunks of
 # >= EXL3_INT8_HAD_QUANT_MIN rows (below that, 3 launches cost more than the saved memory traffic).
@@ -863,8 +864,8 @@ def _env_int(name, default):
         return int(default)
 
 
-_DYN_E = _env_int("EXL3_DRAFT_DYN", 0)
-_DYN_E_NEAR = _env_int("EXL3_DRAFT_DYN_NEAR", _DYN_E)
+_DYN_E = _env_int("EXL3_DRAFT_DYN", 256 if _sm120() else 0)           # reference build: 256 far / 128 near
+_DYN_E_NEAR = _env_int("EXL3_DRAFT_DYN_NEAR", 128 if ("EXL3_DRAFT_DYN" not in os.environ and _sm120()) else _DYN_E)
 try:
     _DYN_BETA = float(os.environ.get("EXL3_DRAFT_BIAS", "0") or 0)
 except ValueError:
@@ -1307,7 +1308,7 @@ def _fa_cu(n: int, device):
 # FA2 build (hdim 256 fp16, 64x64 tile) with fp16-accumulate MMAs: b = P.V fp16 per 64-key block into the fp32 acc_o,
 # f = b + Q.K fp16 per 64 dims flushed to fp32. Numerics change (not bitwise); unset = stock FA2.
 # Module fa_<v> is imported from EXL3_FA16_DIR/fa_<v>/ (default <package>/lib, where csrc/fa16/build.py puts it), then sys.path.
-_FA16_V = os.environ.get("EXL3_FA16", "").strip().lower()
+_FA16_V = _hwenv("EXL3_FA16", "f", "").strip().lower()
 _FA16 = None
 if _FA16_V in ("b", "f"):
     try:
@@ -1326,7 +1327,7 @@ def _fa(q, k, v, causal, scale):
     Q, L = q.shape[0], k.shape[0]
     cq = _fa_cu(Q, q.device)
     ck = _fa_cu(L, q.device)
-    if _FA16 is not None and q.dtype == torch.float16 and q.shape[-1] == 256:
+    if _FA16 is not None and q.dtype == torch.float16 and q.shape[-1] == 256 and _device_ok(q.device):
         return tuple(_FA16.fwd(q, k, v, cq, ck, Q, L, scale, causal))
     return flash_attn_varlen_func(q, k, v, Q, cq, L, cu_seqlens_k=ck, causal=causal, softmax_scale=scale,
                                   return_softmax_lse=True)
@@ -1339,12 +1340,12 @@ try:
     _I8FA = _i8fa_mod if _i8fa_mod.setup(_FA16_V if _FA16 is not None else "") else None
 except Exception as _e:  # noqa
     _I8FA = None
-    if os.environ.get("EXL3_I8FA", "0") == "1":
+    if _hwenv("EXL3_I8FA", "1", "0") == "1":
         logger.warning("exl3: I8FA module not loaded (%s)", _e)
 
 
 def _i8_prefill_fa(q, key_cache, value_cache, pages, seq_len, scale, out):
-    if _I8FA is not None and _I8FA.prefill(q, key_cache, value_cache, pages, seq_len, scale, out, _fa, _FA_KB) is not None:
+    if _I8FA is not None and _device_ok(q.device) and _I8FA.prefill(q, key_cache, value_cache, pages, seq_len, scale, out, _fa, _FA_KB) is not None:
         return out
     Q, bs = q.shape[0], key_cache.shape[1]
     prefix = seq_len - Q
@@ -1500,13 +1501,15 @@ def _patch_int8kv_fa():
     # 170 SMs; kernel benchmark 1.9x Triton at 64-131k, error = Triton's).
     # Pure torch.ops launch with fixed shapes: CUDA-graph safe (persistent scratch, padded sequences have seq_len 0).
     # EXL3_VA=1 on; EXL3_VA_SO = library; anything unexpected -> the original Triton path (logged once).
-    _VA = os.environ.get("EXL3_VA", "0") == "1"
+    _VA = _hwenv("EXL3_VA", "1", "0") == "1"
     _VA_WAVE = int(os.environ.get("EXL3_VA_WAVE", "42"))
     _VA_ST = {}
 
     def _va_ready(dev):
         if "ok" not in _VA_ST:
             try:
+                if not _device_ok(dev):
+                    raise RuntimeError(f"{dev} is not an sm_120 GPU (the VA / VA4 kernels are sm_120 builds)")
                 torch.ops.load_library(os.environ.get("EXL3_VA_SO", os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib", "va5090.so")))
                 n = _VA_WAVE * 4 * 48
                 _VA_ST["po"] = torch.empty(n * 256, dtype=torch.float32, device=dev)
@@ -1963,13 +1966,13 @@ def _patch_gdn_recompute():
 
 # RC-FUSED-IN: gdn_rc.gdn_recompute_fused does the q/k/v split, gating and output write inside
 # the recompute kernel (~12 fewer tiny launches per GDN layer); EXL3_RC_FUSED_IN=1.
-_RC_FUSED_IN = os.environ.get("EXL3_RC_FUSED_IN", "0") == "1"
+_RC_FUSED_IN = _hwenv("EXL3_RC_FUSED_IN", "1", "0") == "1"
 # RC-SLICE (on the XPU the gather/scatter cost 5.9% of a mixed 30k-token step):
 # in mixed steps the non-spec (prefill) rows were gathered with index_select per GDN layer and the output scattered back
 # with index_copy. GDN-RC already requires the spec rows to lead the batch (runner sets GDN_RC["lead"] per step), so
 # the non-spec tokens are the contiguous range [num_spec_decode_tokens, num_actual_tokens): use views, and let the
 # prefill path write straight into core_attn_out. Same rows, same order -> bit-identical. EXL3_RC_SLICE=1.
-_RC_SLICE = os.environ.get("EXL3_RC_SLICE", "0") == "1"
+_RC_SLICE = _hwenv("EXL3_RC_SLICE", "1", "0") == "1"
 
 
 def _rc_forward(self, orig_core, md, md_all, mixed_qkv, b, a, core_attn_out):
@@ -2123,7 +2126,7 @@ def _patch_dyn_sd_full():
     v1 runner a FULL graph is only dispatched for uniform decode batches with query length 1 + num_speculative_tokens
     and the exact request count (BatchDescriptor num_reqs), so steps with a smaller k take PIECEWISE graphs and steps
     with the full k (low concurrency) keep FULL graphs. Measured without this: dynamic k = -44% at 1 stream."""
-    if os.environ.get("EXL3_DYN_SD_FULL", "0") not in ("1", "2"):
+    if _hwenv("EXL3_DYN_SD_FULL", "2", "0") not in ("1", "2"):
         return
     from vllm.config.vllm import VllmConfig
 
@@ -2133,7 +2136,7 @@ def _patch_dyn_sd_full():
             logger.info("EXL3_DYN_SD_FULL: dynamic speculative depth %s with cudagraph_mode %s (not forced to "
                         "PIECEWISE)", sc.num_speculative_tokens_per_batch_size, self.compilation_config.cudagraph_mode.name)
     VllmConfig._maybe_override_dynamic_sd_cudagraph_mode = _keep
-    if os.environ.get("EXL3_DYN_SD_FULL") == "2":
+    if _hwenv("EXL3_DYN_SD_FULL", "2", "0") == "2":
         _patch_multi_q_full_graphs()
 
 
@@ -2320,7 +2323,7 @@ def _patch_kvw4():
     Hadamard, fp16 round, vLLM's quantization math, nibble pack; one launch for K and V) instead of vLLM's
     reshape_and_cache_int4 (2 x single_rht through bf16 hadacore + casts + the pack kernel; eager 449 us vs 8 us at 8
     tokens). 97 % byte-equal to stock (stock rounds the input to bf16 first), error equal or lower. EXL3_KVW4=0 = off."""
-    if os.environ.get("EXL3_KVW4", "1") != "1":
+    if _hwenv("EXL3_KVW4", "1", "0") != "1":
         return
     try:
         import vllm.v1.attention.ops.int4_per_token_head as i4m
@@ -2333,6 +2336,7 @@ def _patch_kvw4():
 
     def reshape_and_cache_int4(key, value, key_cache, value_cache, slot_mapping, *, k_scale_cache, v_scale_cache):
         if (key.dtype == torch.float16 and value.dtype == torch.float16 and key.dim() == 3 and key.shape[-1] == 256
+                and _device_ok(key.device)
                 and key.stride(-1) == 1 and value.stride(-1) == 1 and key_cache.dtype == torch.uint8
                 and value_cache.data_ptr() == key_cache.data_ptr() + 132 and slot_mapping.dtype == torch.int64
                 and k_scale_cache.data_ptr() == key_cache.data_ptr() + 128):
@@ -2384,7 +2388,7 @@ def register():
             logger.warning("exl3: WHX not active (%s: %s)", type(e).__name__, e)
     _patch_block_align()
     _patch_ksmooth()
-    if os.environ.get("EXL3_GDN_PORT", "0") == "1":   # before GDN-RC: its wrapper must call the port-aware core
+    if _hwenv("EXL3_GDN_PORT", "1", "0") == "1":   # before GDN-RC: its wrapper must call the port-aware core
         try:
             from . import gdn_port
             gdn_port.install()
@@ -2396,7 +2400,7 @@ def register():
     _patch_kvw4()
     if os.environ.get("EXL3_DRAFT_VOCAB"):
         _patch_mtp_draft_logits()
-    if os.environ.get("EXL3_TAIL_FUSE", "0") not in ("", "0"):   # TAIL-FUSE (tail_fuse.py)
+    if _hwenv("EXL3_TAIL_FUSE", "1", "0") not in ("", "0"):   # TAIL-FUSE (tail_fuse.py)
         try:
             import sys
             from . import tail_fuse

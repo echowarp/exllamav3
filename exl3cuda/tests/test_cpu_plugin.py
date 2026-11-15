@@ -1,5 +1,6 @@
 """CPU-only checks of the exl3cuda plugin (no GPU, no kernels built): the module imports, the vLLM entry point is
-declared, env-switched features default off, and the weight-keeper loader is resolved from AllBroker first.
+declared, the reference-build defaults apply on sm_120 only (off without a GPU), and the weight-keeper loader is
+resolved from AllBroker first.
 
     python -m pytest -q exl3cuda/tests/test_cpu_plugin.py      (from the repository root)
 """
@@ -122,3 +123,41 @@ def test_config_env_files(name):
         else:
             assert line == "" or line.startswith("#"), line
     assert len(seen) == len(set(seen)) and "EXL3_VA" in seen
+
+
+def test_hw_defaults_off_without_sm120(plugin):
+    """No sm_120 GPU (CPU container): every reference default resolves to its off value; set variables win."""
+    from exl3cuda import hwdefaults
+    assert hwdefaults.sm120() is False
+    for name in ("EXL3_FUSE_DECODE", "EXL3_INT8_PREFILL", "EXL3_FA16", "EXL3_DRAFT_DYN"):
+        os.environ.pop(name, None)
+    assert plugin.FUSE_DECODE is False and plugin.INT8_PREFILL is False and plugin.FUSE_MAX_M == 16
+    assert plugin._FA16_V == "" and plugin._DYN_E == 0 and plugin._DYN_E_NEAR == 0
+    assert hwdefaults.device_ok() is False
+
+
+def test_hw_env_rule(monkeypatch):
+    from exl3cuda import hwdefaults
+    monkeypatch.delenv("EXL3_T_X", raising=False)
+    for on, want in ((True, "ref"), (False, "off")):
+        monkeypatch.setattr(hwdefaults, "sm120", lambda on=on: on)
+        assert hwdefaults.env("EXL3_T_X", "ref", "off") == want
+    monkeypatch.setenv("EXL3_T_X", "")
+    assert hwdefaults.env("EXL3_T_X", "ref", "off") == ""
+
+
+def test_reference_defaults_match_int4_env():
+    """Every hardware-dependent default (_hwenv(NAME, ref, off)) that configs/int4.env or int8.env sets has the
+    file's value as its reference value, so the env files equal the sm_120 defaults."""
+    import glob
+    import re
+    py = "".join(_src(os.path.basename(p)) for p in glob.glob(os.path.join(ROOT, "*.py")))
+    ref = {}
+    for n, r, o in re.findall(r'_hwenv\("(EXL3_[A-Z0-9_]+)", "([^"]*)", "([^"]*)"\)', py):
+        assert ref.setdefault(n, r) == r, n
+    assert {"EXL3_VA", "EXL3_KVW4", "EXL3_FA16", "EXL3_I8FA", "EXL3_GDN_PORT", "EXL3_TAIL_FUSE"} <= set(ref)
+    for name in ("int4.env", "int8.env"):
+        for line in _src("configs", name).splitlines():
+            m = re.match(r"(EXL3_[A-Z0-9_]+)=(.*)$", line)
+            if m and m.group(1) in ref:
+                assert ref[m.group(1)] == m.group(2), (name, line)

@@ -6,9 +6,10 @@ cache, long contexts, several concurrent agents) on one RTX 5090. It is a siblin
 repository and uses its extension (`exllamav3_ext`), including this fork's kernel changes (sm_120 fp16 MMA
 accumulation, gemv3 and the mgemm `c_row_stride` / `c_base` outputs).
 
-Tested with vLLM 0.26.0 (CUDA 13), PyTorch 2.11, sm_120 only. Everything beyond the plain EXL3 linear is opt-in through
-`EXL3_*` environment variables; any feature whose kernel or vLLM internals are missing logs a warning and leaves the
-stock path in place. Some features need companion patches to vLLM itself (noted per variable).
+Tested with vLLM 0.26.0 (CUDA 13), PyTorch 2.11, sm_120 only. Every feature beyond the plain EXL3 linear is switched by
+`EXL3_*` environment variables. Unset, they default to the reference build (Qwen3.8-27B, int4 KV) on an sm_120 GPU
+and to off elsewhere (`hwdefaults.py`); any feature whose kernel, KV dtype or vLLM internals are missing logs a
+warning and leaves the stock path in place. Some features need companion patches to vLLM itself (noted per variable).
 
     pip install ./exl3cuda                     # after building the kernels you want (see below)
     vllm serve <EXL3 checkpoint dir> ...       # quant_method "exl3" in its config.json selects the plugin
@@ -41,6 +42,7 @@ entry point, keeper-loader resolution, defaults, kernel paths vs build outputs, 
 | `int8_kernels.py`, `fused_kernels.py` | Triton int8 (W8A8) prefill GEMM pieces; fused trellis -> int8 decode (L2 split) |
 | `exl3_mma.py` | Triton EXL3 GEMM for 17-64 rows (decode each weight tile once per program) |
 | `vllm_plugin.py` | the vLLM plugin: `exl3` quantization config, linear methods, custom op `exl3cuda::linear` and all engine patches |
+| `hwdefaults.py` | code defaults: the reference build on sm_120, off elsewhere; per-device check before a csrc/ kernel launch |
 | `gdn_rc.py` | Triton GDN recompute kernels |
 | `i8fa_prefill.py`, `csrc/i8fa/` | I8FA int8-KV prefill helpers and kernels |
 | `csrc/fa16/` | FA16 FlashAttention 2 variant (patch + binding + build) |
@@ -56,13 +58,15 @@ Built kernels go to `exl3cuda/lib/` (ignored by git, installed as package data).
 
 ## KV-cache / attention modes (`configs/`)
 
-The attention features depend on the KV-cache dtype, so they come as one env file per mode. Each file lists every
-variable of the mode with what it does, its values and the code default, the vLLM flags that must match, the kernels
-to build, and our measurements.
+On an sm_120 GPU the code defaults are the reference build, including its int4 KV attention path: build the kernels
+and pass `--kv-cache-dtype int4_per_token_head`. For int8 KV only that flag changes (and `csrc/i8fa` is built); the
+features of the other dtype go idle by themselves. The env files document each mode's variables (what each does,
+values, default), the vLLM flags that must match, the kernels to build and our measurements; their values equal the
+sm_120 defaults, so they are optional and pin the configuration.
 
 | Mode | File | vLLM flag | Kernels to build | Measured (RTX 5090, Qwen3.8-27B EXL3 4.0 bpw) |
 |---|---|---|---|---|
-| int4 KV (production) | `configs/int4.env` | `--kv-cache-dtype int4_per_token_head` | `csrc/va`, `csrc/va4` (`-DHPV -DLZT=0.f`), `csrc/kvw4`, `csrc/fa16` | 1.88x the int8 KV capacity; long-context decode +14-16 %; KL vs fp16 KV 0.0044 (+0.0031 vs int8); 3,200-token prefix blocks |
+| int4 KV (default, production) | `configs/int4.env` | `--kv-cache-dtype int4_per_token_head` | `csrc/va`, `csrc/va4` (`-DHPV -DLZT=0.f`), `csrc/kvw4`, `csrc/fa16` | 1.88x the int8 KV capacity; long-context decode +14-16 %; KL vs fp16 KV 0.0044 (+0.0031 vs int8); 3,200-token prefix blocks |
 | int8 KV | `configs/int8.env` | `--kv-cache-dtype int8_per_token_head` | `csrc/va`, `csrc/fa16`, `csrc/i8fa` | KL vs fp16 KV 0.0013; 1,664-token prefix blocks |
 
 Both also need `--attention-backend TRITON_ATTN --dtype float16`. The kernels are specialised for Qwen3.8-27B's
@@ -74,83 +78,87 @@ for that KV dtype. With `--kv-cache-dtype auto` none of these variables apply. U
 
 K smoothing (`EXL3_KSMOOTH`, recommended for both modes) needs a table made from your own traffic (see "Data files you
 supply"); it is commented out in both files. The other features (int8 prefill, fused decode, GDN, MTP drafting) are
-independent of the KV mode and are set from the table below.
+independent of the KV mode; their defaults are in the table below.
 
 ## Environment variables
 
-Production = the Qwen3.8-27B RTX 5090 service (int4_per_token_head KV, MTP k = 7); "default (x)" = not set, code default x.
+Default = the value when the variable is not set. The defaults are the reference build (the Qwen3.8-27B RTX 5090
+service: int4_per_token_head KV, MTP k = 7). "a (sm_120), else b" = a when the first visible GPU is sm_120, b elsewhere
+(`hwdefaults.py`: the csrc/ kernels are sm_120 builds and the Triton paths are tuned for that card); a set variable,
+even an empty one, always wins. "ref: x" = the reference build sets x but the code default stays off (the feature
+needs a data file or a companion change outside this package).
 
-| Variable | Production | What it does |
+| Variable | Default | What it does |
 |---|---|---|
-| `EXL3_INT8_FUSED_MAX_M` | default (512) | fused_kernels.fused_linear: F1 (fused decode + GEMM) up to this many rows, F2 above |
-| `EXL3_INT8_FUSED_ASM` | default (1) | fused_kernels: inline-PTX decode (0 = pure-Triton spelling, same bits) |
-| `EXL3_FUSE_DECODE` | 1 | FUSED-DECODE: a fused module's members (gate+up, q+k+v, GDN qkv+z) as one sliced exllamav3 mgemm at decode/verify row counts |
-| `EXL3_FUSE_MAX_M` | 64 | FUSED-DECODE row limit (default 16) |
-| `EXL3_FUSE_WIDTH` | default (0) | FUSED-DECODE slice width (0 = gcd of the member widths) |
-| `EXL3_FUSE_SCRATCH` | 1 | FUSE-SCRATCH: one shared scratch buffer + precomputed pointer tables for the fused decode modules |
-| `EXL3_INT8_PREFILL` | 1 | INT8-PREFILL: W8A8 int8 tensor-core GEMMs for prefill rows (Hadamard-basis activations, per-token / per-column scales) |
-| `EXL3_INT8_MIN_ROWS` | default (256) | INT8-PREFILL: minimum rows per call |
-| `EXL3_RECON_SLICE_N` | default (16384) | INT8-PREFILL: output columns reconstructed per slice |
-| `EXL3_INT8_HAD_EPI` | default (1) | INT8-PREFILL: output Hadamard fused into the GEMM epilogue |
-| `EXL3_INT8_HAD_QUANT / _MIN` | default (1 / 2048) | INT8-PREFILL: fused input Hadamard + activation quant from this many rows |
-| `EXL3_INT8_RECON_Q8` | default (1) | INT8-PREFILL: trellis decoded straight to transposed int8 (bit-exact) |
-| `EXL3_INT8_L2SPLIT` | 1 | L2SPLIT: faster bit-identical trellis decode into L2-sized int8 slices (fused_kernels.l2_split_linear) |
-| `EXL3_INT8_L2_BUDGET_MB` | default (64) | L2SPLIT slice budget |
-| `EXL3_KV_BLOCK_ALIGN` | default (64) | KV-BLOCK-ALIGN: attention block size of the hybrid GDN model rounded up to a multiple of this (same blocks as the XPU plugin) |
-| `EXL3_NOMMAP_LOAD` | default (1) | weight loading without mmap through `llmt_kv.nommap_loader` (skipped when `llmt_kv` is not installed) |
+| `EXL3_INT8_FUSED_MAX_M` | 512 | fused_kernels.fused_linear: F1 (fused decode + GEMM) up to this many rows, F2 above |
+| `EXL3_INT8_FUSED_ASM` | 1 | fused_kernels: inline-PTX decode (0 = pure-Triton spelling, same bits) |
+| `EXL3_FUSE_DECODE` | 1 (sm_120), else 0 | FUSED-DECODE: a fused module's members (gate+up, q+k+v, GDN qkv+z) as one sliced exllamav3 mgemm at decode/verify row counts |
+| `EXL3_FUSE_MAX_M` | 64 (sm_120), else 16 | FUSED-DECODE row limit |
+| `EXL3_FUSE_WIDTH` | 0 | FUSED-DECODE slice width (0 = gcd of the member widths) |
+| `EXL3_FUSE_SCRATCH` | 1 (sm_120), else 0 | FUSE-SCRATCH: one shared scratch buffer + precomputed pointer tables for the fused decode modules |
+| `EXL3_INT8_PREFILL` | 1 (sm_120), else 0 | INT8-PREFILL: W8A8 int8 tensor-core GEMMs for prefill rows (Hadamard-basis activations, per-token / per-column scales) |
+| `EXL3_INT8_MIN_ROWS` | 256 | INT8-PREFILL: minimum rows per call |
+| `EXL3_RECON_SLICE_N` | 16384 | INT8-PREFILL: output columns reconstructed per slice |
+| `EXL3_INT8_HAD_EPI` | 1 | INT8-PREFILL: output Hadamard fused into the GEMM epilogue |
+| `EXL3_INT8_HAD_QUANT / _MIN` | 1 / 2048 | INT8-PREFILL: fused input Hadamard + activation quant from this many rows |
+| `EXL3_INT8_RECON_Q8` | 1 | INT8-PREFILL: trellis decoded straight to transposed int8 (bit-exact) |
+| `EXL3_INT8_L2SPLIT` | 1 (sm_120), else 0 | L2SPLIT: faster bit-identical trellis decode into L2-sized int8 slices (fused_kernels.l2_split_linear) |
+| `EXL3_INT8_L2_BUDGET_MB` | 64 | L2SPLIT slice budget |
+| `EXL3_KV_BLOCK_ALIGN` | 64 | KV-BLOCK-ALIGN: attention block size of the hybrid GDN model rounded up to a multiple of this (same blocks as the XPU plugin) |
+| `EXL3_NOMMAP_LOAD` | 1 | weight loading without mmap through `llmt_kv.nommap_loader` (skipped when `llmt_kv` is not installed) |
 | `EXL3_GRAPH_DUMP` | unset | diagnosis: dump every captured CUDA graph as .dot to /root/.cache/graph-dump/ |
 | `EXL3_WHX` | unset | optional weight-keeper loader (AllBroker; module from `EXL3_WHX_MODULE`, default `llmt_kv.whx_loader`, then `exl3cuda.whx_loader`, then `whx_loader`); uses the `whx_registry` / `whx_finish` callbacks |
-| `EXL3_GDN_RECOMPUTE` | 1 | GDN recompute: MTP spec decoding with one committed SSM state per request (no 1 + k state pages); needs the companion vLLM gpu_model_runner hooks |
-| `EXL3_GDN_RC_SLOTS` | default (16) | GDN recompute pending-pool slots |
-| `EXL3_RC_FUSED_IN` | 1 | RC-FUSED-IN: q/k/v split, gating and output write inside the recompute kernel |
-| `EXL3_RC_SLICE` | 1 | RC-SLICE: mixed steps use views for the non-spec rows instead of gather/scatter (bit-identical) |
-| `EXL3_RC_BV / EXL3_RC_WARPS` | default (32 / 4) | recompute kernel tile / warps |
-| `EXL3_KSMOOTH` | path to a K-mean table | KSMOOTH: store K - mean (per layer / KV head / channel) in the quantized KV cache; softmax unchanged |
+| `EXL3_GDN_RECOMPUTE` | 0 (ref: 1) | GDN recompute: MTP spec decoding with one committed SSM state per request (no 1 + k state pages); needs the companion vLLM gpu_model_runner hooks |
+| `EXL3_GDN_RC_SLOTS` | 16 | GDN recompute pending-pool slots |
+| `EXL3_RC_FUSED_IN` | 1 (sm_120), else 0 | RC-FUSED-IN: q/k/v split, gating and output write inside the recompute kernel |
+| `EXL3_RC_SLICE` | 1 (sm_120), else 0 | RC-SLICE: mixed steps use views for the non-spec rows instead of gather/scatter (bit-identical) |
+| `EXL3_RC_BV / EXL3_RC_WARPS` | 32 / 4 | recompute kernel tile / warps |
+| `EXL3_KSMOOTH` | unset (ref: a K-mean table) | KSMOOTH: store K - mean (per layer / KV head / channel) in the quantized KV cache; softmax unchanged |
 | `EXL3_KSMOOTH_CALIB` | unset | KSMOOTH calibration: accumulate key means of real traffic (eager engine) and save the table to this path |
-| `EXL3_KSMOOTH_ROBUST` | default (1) | calibration ignores token-heads with key norm > 3x the median (attention sinks) |
-| `EXL3_INT8KV_FA` | default (1) | INT8KV-FA: prefill rows (> EXL3_VERIFY_Q per request) on block-dequantized FA2 instead of Triton unified attention (int8_per_token_head KV) |
-| `EXL3_INT8KV_KB` | default (32768) | INT8KV-FA / I4FA: context tokens dequantized per FA2 call (merged by log-sum-exp) |
+| `EXL3_KSMOOTH_ROBUST` | 1 | calibration ignores token-heads with key norm > 3x the median (attention sinks) |
+| `EXL3_INT8KV_FA` | 1 | INT8KV-FA: prefill rows (> EXL3_VERIFY_Q per request) on block-dequantized FA2 instead of Triton unified attention (int8_per_token_head KV) |
+| `EXL3_INT8KV_KB` | 32768 | INT8KV-FA / I4FA: context tokens dequantized per FA2 call (merged by log-sum-exp) |
 | `EXL3_VERIFY_Q` | 8 | query rows per request treated as decode / verify (k = 7 verify = 8) |
-| `EXL3_FA16` | f | FA16: route those FA2 calls to the fp16-accumulate build (b = P.V fp16, f = b + Q.K fp16); unset = stock FA2 |
-| `EXL3_FA16_DIR` | default (`<package>/lib`) | directory with `fa_f/`, `fa_b/` (then `sys.path`) |
-| `EXL3_I8FA` | 1 | I8FA: CUDA gather-dequant + LSE merge around the same FA2 calls (bitwise equal), paged in-kernel-dequant FA2 for few rows |
-| `EXL3_I8FA_DIR` | default (`<package>/lib`) | directory with `i8kv/`, `i8fa_fp/`, `i8fa_a/` |
+| `EXL3_FA16` | f (sm_120), else unset | FA16: route those FA2 calls to the fp16-accumulate build (b = P.V fp16, f = b + Q.K fp16); unset = stock FA2 |
+| `EXL3_FA16_DIR` | `<package>/lib` | directory with `fa_f/`, `fa_b/` (then `sys.path`) |
+| `EXL3_I8FA` | 1 (sm_120), else 0 | I8FA: CUDA gather-dequant + LSE merge around the same FA2 calls (bitwise equal), paged in-kernel-dequant FA2 for few rows |
+| `EXL3_I8FA_DIR` | `<package>/lib` | directory with `i8kv/`, `i8fa_fp/`, `i8fa_a/` |
 | `EXL3_I8FA_PAGED_MAXQ` | auto | paged route: auto = Q <= 128 and >= 3 parts, N = Q <= N, 0 = off |
-| `EXL3_VA` | 1 | VA: custom CUDA verify / decode attention (<= 8 query rows) for int8 KV; also enables VA4 |
-| `EXL3_VA_SO` | default (`<package>/lib/va5090.so`) | VA library |
-| `EXL3_VA_WAVE` | default (42) | VA CTA-segments per KV head and sequence (one wave on 170 SMs) |
-| `EXL3_VA4` | default (1) | VA4: int4_per_token_head verify / decode attention (with EXL3_VA=1) |
-| `EXL3_VA4_SO` | default (`<package>/lib/va4c.so`) | VA4 library |
-| `EXL3_VA4_OP` | default (va4c) | VA4 op namespace (the `TORCH_LIBRARY` name of the library; va4c = csrc/va4) |
-| `EXL3_VA4_PREFILL_Q` | default (64) | VA4-PSEUDO: prefills up to this many rows go through VA4 as 8-row pseudo-sequences |
-| `EXL3_I4FA` | default (1) | I4FA: int4 KV prefill = gather-dequant + rotated q + the same FA2 / FA16 calls |
-| `EXL3_I4PLAN` | default (1) | I4-PLAN: int4 mixed steps (prefill + decode rows) build the attention row plan once per step from the host copies of query_start_loc / seq lens (attached by a TritonAttentionMetadataBuilder.build hook) instead of 2 DtoH syncs + 4 HtoD copies on every attention layer; 0 = old per-layer path |
-| `EXL3_I4PLAN_CHECK` | default (0) | I4-PLAN diagnosis: compare the host seq lens with the device for the first N plans (one sync each) and fall back to the device values on a mismatch |
-| `EXL3_KVW4` | default (1) | KVW4: fused int4 KV-cache write |
-| `EXL3_KVW4_SO` | default (`<package>/lib/kvw4.so`) | KVW4 library |
-| `EXL3_KSMOOTH_INT4` | default (1) | KS4: K smoothing applied to int4 KV too |
-| `EXL3_GDN_PORT` | 1 | GDN-PORT: GDN prefill through the Magnitude WY kernel (csrc/gdnchunk) instead of FLA |
-| `EXL3_GDN_PORT_SO` | default (`<package>/lib/gdn_chunk_mag.so`) | GDN-PORT extension |
-| `EXL3_GDN_PORT_ROWS` | default (64) | GDN-PORT scan tile |
-| `EXL3_GDN_FAST` | 1 | GDN-FAST: one Triton launch for the decode-step GDN metadata (2 = check every field against the original) |
-| `EXL3_DRAFT_VOCAB` | path to a 512-block draft vocab json | pruned MTP draft head: the drafter proposes from these 128-token vocab blocks (target verifies with the full head) |
-| `EXL3_DRAFT_VOCAB_FAR` | same file | GRADED-DRAFT: vocab for draft positions >= EXL3_DRAFT_FAR_FROM (same file = one shared head copy) |
+| `EXL3_VA` | 1 (sm_120), else 0 | VA: custom CUDA verify / decode attention (<= 8 query rows) for int8 KV; also enables VA4 |
+| `EXL3_VA_SO` | `<package>/lib/va5090.so` | VA library |
+| `EXL3_VA_WAVE` | 42 | VA CTA-segments per KV head and sequence (one wave on 170 SMs) |
+| `EXL3_VA4` | 1 | VA4: int4_per_token_head verify / decode attention (with EXL3_VA=1) |
+| `EXL3_VA4_SO` | `<package>/lib/va4c.so` | VA4 library |
+| `EXL3_VA4_OP` | va4c | VA4 op namespace (the `TORCH_LIBRARY` name of the library; va4c = csrc/va4) |
+| `EXL3_VA4_PREFILL_Q` | 64 | VA4-PSEUDO: prefills up to this many rows go through VA4 as 8-row pseudo-sequences |
+| `EXL3_I4FA` | 1 | I4FA: int4 KV prefill = gather-dequant + rotated q + the same FA2 / FA16 calls |
+| `EXL3_I4PLAN` | 1 | I4-PLAN: int4 mixed steps (prefill + decode rows) build the attention row plan once per step from the host copies of query_start_loc / seq lens (attached by a TritonAttentionMetadataBuilder.build hook) instead of 2 DtoH syncs + 4 HtoD copies on every attention layer; 0 = old per-layer path |
+| `EXL3_I4PLAN_CHECK` | 0 | I4-PLAN diagnosis: compare the host seq lens with the device for the first N plans (one sync each) and fall back to the device values on a mismatch |
+| `EXL3_KVW4` | 1 (sm_120), else 0 | KVW4: fused int4 KV-cache write |
+| `EXL3_KVW4_SO` | `<package>/lib/kvw4.so` | KVW4 library |
+| `EXL3_KSMOOTH_INT4` | 1 | KS4: K smoothing applied to int4 KV too |
+| `EXL3_GDN_PORT` | 1 (sm_120), else 0 | GDN-PORT: GDN prefill through the Magnitude WY kernel (csrc/gdnchunk) instead of FLA |
+| `EXL3_GDN_PORT_SO` | `<package>/lib/gdn_chunk_mag.so` | GDN-PORT extension |
+| `EXL3_GDN_PORT_ROWS` | 64 | GDN-PORT scan tile |
+| `EXL3_GDN_FAST` | 1 (sm_120), else 0 | GDN-FAST: one Triton launch for the decode-step GDN metadata (2 = check every field against the original) |
+| `EXL3_DRAFT_VOCAB` | unset (ref: a 512-block draft vocab json) | pruned MTP draft head: the drafter proposes from these 128-token vocab blocks (target verifies with the full head) |
+| `EXL3_DRAFT_VOCAB_FAR` | unset (ref: the same file) | GRADED-DRAFT: vocab for draft positions >= EXL3_DRAFT_FAR_FROM (same file = one shared head copy) |
 | `EXL3_DRAFT_FAR_FROM` | 2 | first draft position (0-based) that uses the far vocab |
-| `EXL3_DRAFT_WEIGHTS` | path to a 4-bit draft head | re-quantized draft head / MTP linears (tools/quantize_draft.py) |
-| `EXL3_DRAFT_DYN / _NEAR` | 256 / 128 | DRAFT-DYN: up to E extra draft-head rows per request (its most frequent prompt tokens), far / near passes |
+| `EXL3_DRAFT_WEIGHTS` | unset (ref: a 4-bit draft head) | re-quantized draft head / MTP linears (tools/quantize_draft.py) |
+| `EXL3_DRAFT_DYN / _NEAR` | 256 / 128 (sm_120), else 0 / 0 | DRAFT-DYN: up to E extra draft-head rows per request (its most frequent prompt tokens), far / near passes |
 | `EXL3_DRAFT_BIAS` | 0 | DRAFT-DYN: drafter logit bias on prompt tokens |
-| `EXL3_DRAFT_DYN_GS / _BG / _DELAY_US` | default (64 / 1 / 2000) | DRAFT-DYN host int4 group size, background uploads, upload delay |
-| `LLMT_FASTLAUNCH` | default (0) | FAST-LAUNCH (fastlaunch.py): cached Triton CompiledKernel launches for the draft-loop kernels (DYN-ROW extras, draft_scatter, vLLM's eagle step update); bit-identical, saves host time per step (single stream +0-1.9 % steps/s on an RTX 5090); not in the production configuration. `LLMT_FASTLAUNCH_CHECK=N` compares N draft_scatter launches with a plain launch |
+| `EXL3_DRAFT_DYN_GS / _BG / _DELAY_US` | 64 / 1 / 2000 | DRAFT-DYN host int4 group size, background uploads, upload delay |
+| `LLMT_FASTLAUNCH` | 0 | FAST-LAUNCH (fastlaunch.py): cached Triton CompiledKernel launches for the draft-loop kernels (DYN-ROW extras, draft_scatter, vLLM's eagle step update); bit-identical, saves host time per step (single stream +0-1.9 % steps/s on an RTX 5090); not in the production configuration. `LLMT_FASTLAUNCH_CHECK=N` compares N draft_scatter launches with a plain launch |
 | `EXL3_DRAFT_WINDOW` | unset | DRAFT-WINDOW: sliding window for the MTP layer's attention (drafts only) |
 | `EXL3_CAPTURE_MTP_H / _EVERY` | unset | capture X^T X of the MTP linears' inputs for calibrated draft re-quantization (eager engine) |
-| `EXL3_TAIL_FUSE` | 1 | TAIL-FUSE: bit-exact trimming of the decode small-kernel tail; 1 = all parts or a list of cat, scratch, conv, ks, dlog |
-| `EXL3_TAIL_CONV_BN / _WARPS` | default (auto) | TAIL-FUSE conv tiling |
-| `EXL3_DYN_SD_FULL` | 2 | keep FULL decode cudagraphs with dynamic speculative depth (2 = FULL graphs for every depth of the schedule) |
-| `EXL3_UNIFORM_SPEC` | default (1) | UNIFORM-SPEC: only all-spec-decode steps take the uniform-decode path (fixes NaN on 1 + k-token prefill chunks) |
-| `EXL3_MIX3D` | default (1) | MIX-3D: decode / verify rows of mixed steps use the split-softmax 3D attention kernel |
+| `EXL3_TAIL_FUSE` | 1 (sm_120), else 0 | TAIL-FUSE: bit-exact trimming of the decode small-kernel tail; 1 = all parts or a list of cat, scratch, conv, ks, dlog |
+| `EXL3_TAIL_CONV_BN / _WARPS` | auto | TAIL-FUSE conv tiling |
+| `EXL3_DYN_SD_FULL` | 2 (sm_120), else 0 | keep FULL decode cudagraphs with dynamic speculative depth (2 = FULL graphs for every depth of the schedule) |
+| `EXL3_UNIFORM_SPEC` | 1 | UNIFORM-SPEC: only all-spec-decode steps take the uniform-decode path (fixes NaN on 1 + k-token prefill chunks) |
+| `EXL3_MIX3D` | 1 | MIX-3D: decode / verify rows of mixed steps use the split-softmax 3D attention kernel |
 | `EXL3_PROFILE_AT / _N` | unset | diagnosis: torch.profiler for N steps from step AT, top kernels logged |
-| `EXL3_LAZY_VISION` | 1 | lazyvis: vision tower in pinned host memory, loaded / streamed only for image requests (needs the companion vLLM qwen3_vl.py hook) |
-| `EXL3_LAZY_VISION_TTL / _MARGIN_MB / _MODE` | default (120 / 256 / auto) | lazyvis residency TTL, memory margin, auto / stream / resident |
+| `EXL3_LAZY_VISION` | 0 (ref: 1) | lazyvis: vision tower in pinned host memory, loaded / streamed only for image requests (needs the companion vLLM qwen3_vl.py hook) |
+| `EXL3_LAZY_VISION_TTL / _MARGIN_MB / _MODE` | 120 / 256 / auto | lazyvis residency TTL, memory margin, auto / stream / resident |
 
 ## Building the kernels
 

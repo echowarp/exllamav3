@@ -25,6 +25,7 @@ import os
 import torch
 
 from vllm.logger import init_logger
+from exl3cuda.hwdefaults import env as _hwenv
 from vllm.triton_utils import tl, triton
 
 logger = init_logger("vllm.exl3cuda")
@@ -33,7 +34,7 @@ _ALL = ("cat", "scratch", "conv", "ks", "dlog")
 
 
 def _parts():
-    v = os.environ.get("EXL3_TAIL_FUSE", "0").strip()
+    v = _hwenv("EXL3_TAIL_FUSE", "1", "0").strip()
     if v in ("", "0"):
         return set()
     if v == "1":

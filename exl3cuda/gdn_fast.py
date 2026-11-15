@@ -6,7 +6,7 @@ Here: two .tolist() on CPU tensors for the classification and ONE Triton launch 
 buffers (state indices from the align-mode block-table gather, sequence mask, query start locations, accepted
 counts). Integer outputs, identical to the original by construction; EXL3_GDN_FAST=2 checks every field against the
 original builder on each step (logs the first mismatches, keeps the original's result). Any other step shape -> the
-original builder. EXL3_GDN_FAST=0 / unset = off."""
+original builder. EXL3_GDN_FAST=0 = off; unset = 1 on sm_120 (hwdefaults.py), off elsewhere. Installed by GDN-PORT."""
 import logging
 import os
 
@@ -15,8 +15,9 @@ import triton
 import triton.language as tl
 
 from vllm.logger import init_logger
+from exl3cuda.hwdefaults import env as _hwenv
 logger = init_logger("vllm.exl3cuda.gdn_fast")
-MODE = int(os.environ.get("EXL3_GDN_FAST", "0") or 0)
+MODE = int(_hwenv("EXL3_GDN_FAST", "1", "0") or 0)
 _ST = {"fast": 0, "orig": 0, "checked": 0, "mismatch": 0}
 
 

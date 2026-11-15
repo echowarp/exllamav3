@@ -1,7 +1,8 @@
 // va4c_kernel.cu: int4-KV verify / decode attention for Qwen3.8-27B on the RTX 5090 (op namespace va4c).
 // Third revision of the int4 version of csrc/va/va_kernel.cu (same strategies as the Intel Arc XPU kernels):
 //  * LAZY rescale: rescale O / l only when a row max grows by > 8 in log2 units (p <= 256, safe in fp16); optional
-//    -DHPV (PV accumulated in fp16 per 32-token tile, then added to fp32; not used by default).
+//    -DHPV (PV accumulated in fp16 per 32-token tile, then added to fp32; csrc/va4/build.py builds
+//    with -DHPV -DLZT=0.f by default).
 //  * QK on int8 tensor cores (the fp16 version measured ~107 TFLOPS = the 5090's fp16/fp32-acc mma ceiling): prerot
 //    also quantizes q_r to int8 per (token, head) row; K = (n - zp) as exact signed bytes (__vsub4); one 32-bit K word
 //    = one m16n8k32 s8 k-step. PV fp16 x fp16 -> fp32.
