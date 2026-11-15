@@ -24,7 +24,7 @@ layer, [AllBroker](https://github.com/echowarp/AllBroker) (`llmt_kv` package):
 |---|---|---|
 | Weight keeper (weights stay resident across engine restarts) | AllBroker `llmt-keeper` daemon + engine-side loader `whx_loader` | two loader callbacks only: `whx_registry(model)` (the EXL3 linears' tensors by module name) and `whx_finish(model)` (rebuild the kernel objects from held tensors after an attach). Off unless `EXL3_WHX` is set; the loader module comes from `EXL3_WHX_MODULE` (default `llmt_kv.whx_loader`) |
 | No-mmap safetensors loader | AllBroker `llmt_kv.nommap_loader` | nothing; used when `llmt_kv` is installed, else vLLM's loader |
-| KV lending, LoRA / vision / prefill scratch, RAM KV tier | AllBroker (`llmt_kv`, vLLM plugin + connector) | LoRA kernels only (none here yet for CUDA) |
+| KV lending (LoRA / vision), RAM KV tier | AllBroker (`llmt_kv`, vLLM plugin + connector) | LoRA kernels only (none here yet for CUDA) |
 | Lazy vision tower | AllBroker's broker-managed version (VRAM budget shared with KV lending) | `llmt_lazyvis.py`: the standalone device-only version production runs today (`EXL3_LAZY_VISION`). Kept for compatibility; with AllBroker installed, its module takes over (the standalone copy then stays off by itself) |
 
 GPU-specific settings are configuration, not code: every feature is an `EXL3_*` variable (table below), and the
