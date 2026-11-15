@@ -1,7 +1,7 @@
 """Build one FA16 variant: python3 build.py NAME FA16_PV FA16_QK  (production variant f: `build.py fa_f 1 2`).
 
 Needs ./srcmod and ./fa from fetch_and_patch.sh (or FA_SRC / CUTLASS_INC). Output: <package>/lib/NAME/NAME.so; the
-plugin imports module fa_<EXL3_FA16> from /fa16ext/fa_<v> or from sys.path, so put <package>/lib/fa_f on PYTHONPATH.
+plugin imports module fa_<EXL3_FA16> from EXL3_FA16_DIR/fa_<v>/ (default <package>/lib, i.e. this output) or from sys.path.
 Variants: fa_b = 1 0 (P.V fp16 per 64-key block), fa_f = 1 2 (fa_b + Q.K fp16 per 64 dims). sm_120 only.
 One nvcc needs ~12 GB RAM: MAX_JOBS=1 is the default. EXL3_EXTRA_INC: extra include dirs (':'-separated), e.g. for
 CUDA library headers (cuSPARSE / cuSOLVER / cuFFT) that torch's headers include but a runtime image may lack.

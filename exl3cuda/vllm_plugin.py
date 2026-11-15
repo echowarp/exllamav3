@@ -1306,12 +1306,14 @@ def _fa_cu(n: int, device):
 # FA16 (kernels: csrc/fa16): EXL3_FA16=b|f routes the int8-KV prefill FA2 calls to a pruned
 # FA2 build (hdim 256 fp16, 64x64 tile) with fp16-accumulate MMAs: b = P.V fp16 per 64-key block into the fp32 acc_o,
 # f = b + Q.K fp16 per 64 dims flushed to fp32. Numerics change (not bitwise); unset = stock FA2.
+# Module fa_<v> is imported from EXL3_FA16_DIR/fa_<v>/ (default <package>/lib, where csrc/fa16/build.py puts it), then sys.path.
 _FA16_V = os.environ.get("EXL3_FA16", "").strip().lower()
 _FA16 = None
 if _FA16_V in ("b", "f"):
     try:
         import importlib, sys as _sys
-        _sys.path.insert(0, f"/fa16ext/fa_{_FA16_V}")
+        _fa16_dir = os.environ.get("EXL3_FA16_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib"))
+        _sys.path.insert(0, os.path.join(_fa16_dir, f"fa_{_FA16_V}"))
         _FA16 = importlib.import_module(f"fa_{_FA16_V}")
         logger.info("exl3: FA16 on (variant %s)", _FA16_V)
     except Exception as e:  # noqa
@@ -1584,7 +1586,7 @@ def _patch_int8kv_fa():
             return False
         if "va4" not in _VA_ST:
             try:
-                torch.ops.load_library(os.environ.get("EXL3_VA4_SO", os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib", "va4b.so")))
+                torch.ops.load_library(os.environ.get("EXL3_VA4_SO", os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib", "va4c.so")))
                 from vllm.v1.attention.ops.int4_per_token_head import _get_rht_signs
                 _VA_ST["signs"] = _get_rht_signs(256, 0, query.device).float().contiguous()
                 _VA_ST["qr"] = torch.empty(_VA_WAVE * 8, 24, 256, dtype=torch.float16, device=query.device)
@@ -1621,7 +1623,7 @@ def _patch_int8kv_fa():
         if _VA_ST["n4"] in (1, 1000):
             logger.info("exl3: VA4 dispatch #%d (q strides %s, capturing %s)", _VA_ST["n4"], tuple(q.stride()),
                         torch.cuda.is_current_stream_capturing())
-        getattr(torch.ops, os.environ.get("EXL3_VA4_OP", "va4b")).forward(q, key_cache, key_cache.stride(0), key_cache.stride(2), key_cache.stride(1),
+        getattr(torch.ops, os.environ.get("EXL3_VA4_OP", "va4c")).forward(q, key_cache, key_cache.stride(0), key_cache.stride(2), key_cache.stride(1),
                               md.block_table, md.seq_lens, md.query_start_loc, out, _VA_ST["po"], _VA_ST["pm"],
                               _VA_ST["pl"], _VA_ST["signs"], _VA_ST["qr"], max(1, _VA_WAVE // nseq), key_cache.shape[1],
                               self.scale, md.max_query_len)
@@ -1675,7 +1677,7 @@ def _patch_int8kv_fa():
             os_ = torch.empty_like(qs)
             bt = md.block_table.index_select(0, idx)
             if use_va4:
-                getattr(torch.ops, os.environ.get("EXL3_VA4_OP", "va4b")).forward(
+                getattr(torch.ops, os.environ.get("EXL3_VA4_OP", "va4c")).forward(
                     qs, key_cache, key_cache.stride(0), key_cache.stride(2), key_cache.stride(1), bt, sls, cu, os_,
                     _VA_ST["po"], _VA_ST["pm"], _VA_ST["pl"], _VA_ST["signs"], _VA_ST["qr"],
                     max(1, _VA_WAVE // len(grp)), key_cache.shape[1], self.scale, max(lens))
@@ -1773,7 +1775,7 @@ def _patch_int8kv_fa():
             qs = q.index_select(0, g["rows"]).contiguous()
             os_ = torch.empty_like(qs)
             if use_va4:
-                getattr(torch.ops, os.environ.get("EXL3_VA4_OP", "va4b")).forward(
+                getattr(torch.ops, os.environ.get("EXL3_VA4_OP", "va4c")).forward(
                     qs, key_cache, key_cache.stride(0), key_cache.stride(2), key_cache.stride(1), g["bt"], g["sls"],
                     g["cu"], os_, _VA_ST["po"], _VA_ST["pm"], _VA_ST["pl"], _VA_ST["signs"], _VA_ST["qr"],
                     max(1, _VA_WAVE // g["n"]), key_cache.shape[1], self.scale, g["maxlen"])

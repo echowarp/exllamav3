@@ -83,3 +83,42 @@ def test_lazyvis_default_off():
         if old is not None:
             os.environ["EXL3_LAZY_VISION"] = old
     assert m.ON is False and m.MODE == "auto" and m.TTL == 120.0
+
+
+def _src(*parts):
+    with open(os.path.join(ROOT, *parts)) as f:
+        return f.read()
+
+
+def test_kernel_defaults_match_build_outputs():
+    """Every '<package>/lib/<x>.so' default names a file a csrc/*/build.py writes; the VA4 op default is the
+    TORCH_LIBRARY namespace of the shipped VA4 kernel."""
+    import glob
+    import re
+    py = "".join(_src(os.path.basename(p)) for p in glob.glob(os.path.join(ROOT, "*.py")))
+    builds = "".join(_src(os.path.relpath(p, ROOT)) for p in glob.glob(os.path.join(ROOT, "csrc", "*", "build.py")))
+    so = set(re.findall(r'"lib", "([A-Za-z0-9_]+\.so)"', py))
+    assert so >= {"va5090.so", "va4c.so", "kvw4.so", "gdn_chunk_mag.so"}
+    for name in so:
+        assert f'"{name}"' in builds, name
+    op = set(re.findall(r'os\.environ\.get\("EXL3_VA4_OP", "([a-z0-9_]+)"\)', py))
+    assert op == set(re.findall(r"TORCH_LIBRARY\(([a-z0-9_]+),", _src("csrc", "va4", "va4c_kernel.cu")))
+
+
+@pytest.mark.parametrize("name", ["int4.env", "int8.env"])
+def test_config_env_files(name):
+    """configs/*.env: plain VAR=value lines (docker --env-file and `set -a; .` both read them) and only variables
+    the package reads."""
+    import glob
+    import re
+    py = "".join(_src(os.path.basename(p)) for p in glob.glob(os.path.join(ROOT, "*.py")))
+    seen = []
+    for line in _src("configs", name).splitlines():
+        m = re.match(r"#?(EXL3_[A-Z0-9_]+)=(.*)$", line)
+        if m:
+            assert re.fullmatch(r"[^\s#'\"]*", m.group(2)), line
+            assert f'"{m.group(1)}"' in py, m.group(1)
+            seen.append(m.group(1))
+        else:
+            assert line == "" or line.startswith("#"), line
+    assert len(seen) == len(set(seen)) and "EXL3_VA" in seen

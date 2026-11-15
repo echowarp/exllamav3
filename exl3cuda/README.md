@@ -31,7 +31,7 @@ production values are listed per variable. Kernel libraries are found next to th
 variable names another path.
 
 CPU-only checks (no GPU, no kernels built): `python -m pytest -q exl3cuda/tests/test_cpu_plugin.py` (plugin import,
-entry point, keeper-loader resolution, defaults). Kernel tests need an sm_120 GPU.
+entry point, keeper-loader resolution, defaults, kernel paths vs build outputs, `configs/` files). Kernel tests need an sm_120 GPU.
 
 ## Layout
 
@@ -50,8 +50,31 @@ entry point, keeper-loader resolution, defaults). Kernel tests need an sm_120 GP
 | `draftdyn.py`, `tools/quantize_draft.py` | DRAFT-DYN pieces; draft-head re-quantization tool |
 | `tail_fuse.py` | TAIL-FUSE decode tail fusions |
 | `llmt_lazyvis.py` | lazy vision tower (top-level module `llmt_lazyvis`, imported by the companion vLLM qwen3_vl.py hook) |
+| `configs/` | env files for the KV-cache / attention modes (`int4.env`, `int8.env`) |
 
 Built kernels go to `exl3cuda/lib/` (ignored by git, installed as package data).
+
+## KV-cache / attention modes (`configs/`)
+
+The attention features depend on the KV-cache dtype, so they come as one env file per mode. Each file lists every
+variable of the mode with what it does, its values and the code default, the vLLM flags that must match, the kernels
+to build, and our measurements.
+
+| Mode | File | vLLM flag | Kernels to build | Measured (RTX 5090, Qwen3.8-27B EXL3 4.0 bpw) |
+|---|---|---|---|---|
+| int4 KV (production) | `configs/int4.env` | `--kv-cache-dtype int4_per_token_head` | `csrc/va`, `csrc/va4`, `csrc/kvw4`, `csrc/fa16` | 1.88x the int8 KV capacity; long-context decode +14-16 %; KL vs fp16 KV 0.0044 (+0.0031 vs int8); 3,200-token prefix blocks |
+| int8 KV | `configs/int8.env` | `--kv-cache-dtype int8_per_token_head` | `csrc/va`, `csrc/fa16`, `csrc/i8fa` | KL vs fp16 KV 0.0013; 1,664-token prefix blocks |
+
+Both also need `--attention-backend TRITON_ATTN --dtype float16`. The kernels are specialised for Qwen3.8-27B's
+attention shape (24 query heads, 4 KV heads, head size 256) on sm_120; anything else falls back to vLLM's stock path
+for that KV dtype. With `--kv-cache-dtype auto` none of these variables apply. Use a file as is, or copy and edit it:
+
+    docker run --env-file exl3cuda/configs/int4.env ... <image> vllm serve <model> --kv-cache-dtype int4_per_token_head ...
+    set -a; . exl3cuda/configs/int4.env; set +a; vllm serve <model> --kv-cache-dtype int4_per_token_head ...
+
+K smoothing (`EXL3_KSMOOTH`, recommended for both modes) needs a table made from your own traffic (see "Data files you
+supply"); it is commented out in both files. The other features (int8 prefill, fused decode, GDN, MTP drafting) are
+independent of the KV mode and are set from the table below.
 
 ## Environment variables
 
@@ -89,6 +112,7 @@ Production = the Qwen3.8-27B RTX 5090 service (int4_per_token_head KV, MTP k = 7
 | `EXL3_INT8KV_KB` | default (32768) | INT8KV-FA / I4FA: context tokens dequantized per FA2 call (merged by log-sum-exp) |
 | `EXL3_VERIFY_Q` | 8 | query rows per request treated as decode / verify (k = 7 verify = 8) |
 | `EXL3_FA16` | f | FA16: route those FA2 calls to the fp16-accumulate build (b = P.V fp16, f = b + Q.K fp16); unset = stock FA2 |
+| `EXL3_FA16_DIR` | default (`<package>/lib`) | directory with `fa_f/`, `fa_b/` (then `sys.path`) |
 | `EXL3_I8FA` | 1 | I8FA: CUDA gather-dequant + LSE merge around the same FA2 calls (bitwise equal), paged in-kernel-dequant FA2 for few rows |
 | `EXL3_I8FA_DIR` | default (`<package>/lib`) | directory with `i8kv/`, `i8fa_fp/`, `i8fa_a/` |
 | `EXL3_I8FA_PAGED_MAXQ` | auto | paged route: auto = Q <= 128 and >= 3 parts, N = Q <= N, 0 = off |
@@ -96,8 +120,8 @@ Production = the Qwen3.8-27B RTX 5090 service (int4_per_token_head KV, MTP k = 7
 | `EXL3_VA_SO` | default (`<package>/lib/va5090.so`) | VA library |
 | `EXL3_VA_WAVE` | default (42) | VA CTA-segments per KV head and sequence (one wave on 170 SMs) |
 | `EXL3_VA4` | default (1) | VA4: int4_per_token_head verify / decode attention (with EXL3_VA=1) |
-| `EXL3_VA4_SO` | `<package>/lib/va4c.so` | VA4 library (the code default names an older `va4b.so` variant that is not shipped: set this) |
-| `EXL3_VA4_OP` | va4c | VA4 op namespace (code default `va4b`: set `va4c` for the kernel in csrc/va4) |
+| `EXL3_VA4_SO` | default (`<package>/lib/va4c.so`) | VA4 library |
+| `EXL3_VA4_OP` | default (va4c) | VA4 op namespace (the `TORCH_LIBRARY` name of the library; va4c = csrc/va4) |
 | `EXL3_VA4_PREFILL_Q` | default (64) | VA4-PSEUDO: prefills up to this many rows go through VA4 as 8-row pseudo-sequences |
 | `EXL3_I4FA` | default (1) | I4FA: int4 KV prefill = gather-dequant + rotated q + the same FA2 / FA16 calls |
 | `EXL3_I4PLAN` | default (1) | I4-PLAN: int4 mixed steps (prefill + decode rows) build the attention row plan once per step from the host copies of query_start_loc / seq lens (attached by a TritonAttentionMetadataBuilder.build hook) instead of 2 DtoH syncs + 4 HtoD copies on every attention layer; 0 = old per-layer path |
@@ -142,7 +166,7 @@ vllm-project/flash-attention `caaa4eb5` (vLLM 0.26.0's pin) + CUTLASS, patched w
     cd exl3cuda/csrc/fa16
     ./fetch_and_patch.sh            # clones FA2 + cutlass, writes ./srcmod
     python3 build.py fa_f 1 2       # production variant f -> exl3cuda/lib/fa_f/fa_f.so  (fa_b: 1 0)
-    export PYTHONPATH=$PWD/../../lib/fa_f:$PYTHONPATH   # the plugin imports module fa_f (or from /fa16ext/fa_f)
+                                    # the plugin imports fa_f from EXL3_FA16_DIR/fa_f (default exl3cuda/lib), then sys.path
 
 One nvcc needs ~12 GB RAM (`MAX_JOBS=1`); `build-seq.sh fa_f:1:2 fa_b:1:0` builds variants one at a time.
 
