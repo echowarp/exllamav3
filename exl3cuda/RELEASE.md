@@ -25,6 +25,7 @@ Branch `publish-20261113`. Features and switches: `exl3cuda/README.md`.
 - The numbers above used production's traffic-ranked draft vocabulary and its 4-bit draft head; with a public
   vocabulary (AllRunner `data/draft-vocab/`) and no re-quantized head (about -3 % decode) they are not measured yet.
 - Two starts of the same engine are not bit-identical (4/6 greedy prompts identical, max |dlp| 0.091).
-- No K-smoothing table ships (int4 KL 0.0051 without vs 0.0044 with, measured on agent tokens).
+- K smoothing (int4 KL 0.0051 without vs 0.0044 with a table, measured on agent tokens): AllRunner ships a public table
+  (`data/ksmooth/public_r.pt`, same format); it was measured on the Arc, its load on this GPU is not checked yet.
 - Kernels are specialised for Qwen3.8-27B attention shapes on sm_120; other shapes fall back to vLLM's stock paths.
 - The Docker image (AllRunner `docker/Dockerfile.rtx5090`) has not been rebuilt from the published commits yet.
