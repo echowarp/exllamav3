@@ -77,8 +77,8 @@ for that KV dtype. With `--kv-cache-dtype auto` none of these variables apply. U
     docker run --env-file exl3cuda/configs/int4.env ... <image> vllm serve <model> --kv-cache-dtype int4_per_token_head ...
     set -a; . exl3cuda/configs/int4.env; set +a; vllm serve <model> --kv-cache-dtype int4_per_token_head ...
 
-K smoothing (`EXL3_KSMOOTH`, recommended for both modes) needs a table made from your own traffic (see "Data files you
-supply"); it is commented out in both files. The other features (int8 prefill, fused decode, GDN, MTP drafting) are
+K smoothing (`EXL3_KSMOOTH`, recommended for both modes) needs a table file (see "Data files you supply"; AllRunner
+ships a public one); it is commented out in both files. The other features (int8 prefill, fused decode, GDN, MTP drafting) are
 independent of the KV mode; their defaults are in the table below.
 
 ## Environment variables
@@ -218,19 +218,45 @@ See `csrc/gdnchunk/README.md` for the kernel, its argument contract and measurem
 
 ## Data files you supply
 
-These are derived from a deployment's own traffic or weights and are not part of the package:
+Not part of this package. Public builds of the first two ship with [AllRunner](https://github.com/echowarp/AllRunner)
+(`data/ksmooth/public_r.pt`, `data/draft-vocab/public-512.json`), whose RTX 5090 launcher uses them by default; see
+"Tuning for your own traffic" below to rebuild them from your own traffic.
 
-- **K smoothing table** (`EXL3_KSMOOTH`): not shipped. Generate it on your own traffic: run the engine eagerly
+- **K smoothing table** (`EXL3_KSMOOTH`): generate it on your own traffic: run the engine eagerly
   (`--enforce-eager`) with `EXL3_KSMOOTH_CALIB=<out.pt>` (and int8 KV) over representative prompts; the plugin saves
   `{layer_name: mean[H, D]}` every 64 calls. Then serve with `EXL3_KSMOOTH=<out.pt>`.
 
-- **Draft vocabulary** (`EXL3_DRAFT_VOCAB`): not shipped. A json `{"block_size": 128, "blocks": [...]}` listing the
+- **Draft vocabulary** (`EXL3_DRAFT_VOCAB`): a json `{"block_size": 128, "blocks": [...]}` listing the
   128-token vocab blocks the drafter may propose (block_size must be a multiple of 128). Rank blocks by token
   frequency on text like your own model outputs and keep the top N (production uses 512 blocks); force-include
   special tokens. The exl3xpu project's `scripts/draft_vocab.py` (MIT) builds one from a text corpus.
-- **Draft weights** (`EXL3_DRAFT_WEIGHTS`): not shipped. `tools/quantize_draft.py --bf16 <BF16 checkpoint dir>
+- **Draft weights** (`EXL3_DRAFT_WEIGHTS`): not shipped (no public build). `tools/quantize_draft.py --bf16 <BF16 checkpoint dir>
   --vocab <draft vocab json> --no-mtp --k-head 4 --out head4.safetensors` re-quantizes the draft head rows to 4 bpw
   (drafts only: outputs stay exact). Needs exllamav3 and the BF16 weights of the model.
+
+### Tuning for your own traffic
+
+- **Out of the box** the public draft vocabulary (AllRunner `data/draft-vocab/public-512.json`, near = far on this GPU)
+  and the public K-smoothing table (AllRunner `data/ksmooth/public_r.pt`) are the AllRunner launcher's defaults. Measured against the tables production builds from its own agent traffic: the public K-smoothing
+  table gives NLL +0.037 %, top-5 KL 4.2e-3 and single-stream decode 192 vs 193 tok/s (Arc B70, int4 KV, 126,099
+  held-out GSM8K tokens; no table: NLL +0.43 %, 142 tok/s); the public vocabularies cover the same share of held-out
+  model outputs (512 / 128 blocks: 99.3 / 94.8 % on GSM8K, 96.5 / 81.6 % on IFBench). Decode speed with the public
+  vocabularies has not been measured yet.
+- **Draft vocabulary from your traffic:** rank on text like your model's outputs with exl3xpu
+  `scripts/draft_vocab.py --model <checkpoint> --blocks 512 --text '<your outputs>/*.txt' --out draft-512.json` (and
+  `--blocks 128` for the far head). `scripts/public_draft_vocab.py` is the same ranking over its fixed public input set.
+  Drafts only: the output distribution does not change, only how many draft tokens are accepted.
+- **K-smoothing table from your traffic:** run ONE engine eager (`enforce_eager`) with `EXL3_KSMOOTH_CALIB=/path/ksmooth.pt`
+  and without `EXL3_KSMOOTH`, on the KV dtype you serve with, over representative traffic or a replay of it. The table is
+  rewritten as it goes (exl3xpu: every `EXL3_KSMOOTH_CALIB_EVERY` batches, default 1; exl3cuda: every 64 calls). Then
+  restart serving with `EXL3_KSMOOTH=/path/ksmooth.pt` (and without `EXL3_KSMOOTH_CALIB`). exl3xpu
+  `scripts/public_ksmooth.py` is this procedure fed with public text. The file format is the same on both GPUs.
+- **Caveats:** calibration needs an eager engine (no graphs, so it is slower while it runs): use a separate engine or a
+  quiet period. A new table invalidates cached KV and the RAM-tier entries (the table's checksum is part of the tier's
+  compatibility tag), so switch at a planned restart; engines that share a RAM tier must all use the same table. This
+  is how production does it.
+
+On this GPU the public table's load has not been checked yet (the numbers above are from the Arc B70).
 
 ## Licenses
 
