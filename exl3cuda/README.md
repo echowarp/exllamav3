@@ -50,6 +50,7 @@ entry point, keeper-loader resolution, defaults, kernel paths vs build outputs, 
 | `csrc/va4/`, `csrc/kvw4/` | VA4 verify attention and KVW4 KV write (int4 KV) |
 | `gdn_port.py`, `gdn_fast.py`, `csrc/gdnchunk/` | GDN prefill via the Magnitude kernel; fast GDN decode metadata |
 | `draftdyn.py`, `tools/quantize_draft.py` | DRAFT-DYN pieces; draft-head re-quantization tool |
+| `draftgraph.py` | DRAFT-GRAPH: draft loop passes 2..k as one CUDA graph (`EXL3_DRAFT_GRAPH=1`) |
 | `tail_fuse.py` | TAIL-FUSE decode tail fusions |
 | `llmt_lazyvis.py` | lazy vision tower (top-level module `llmt_lazyvis`, imported by the companion vLLM qwen3_vl.py hook) |
 | `configs/` | env files for the KV-cache / attention modes (`int4.env`, `int8.env`) |
@@ -157,6 +158,7 @@ linears and the EXL3 draft head only.)
 | `EXL3_DRAFT_VOCAB` | unset (ref: a 512-block draft vocab json) | pruned MTP draft head: the drafter proposes from these 128-token vocab blocks (target verifies with the full head) |
 | `EXL3_DRAFT_VOCAB_FAR` | unset (ref: the same file) | GRADED-DRAFT: vocab for draft positions >= EXL3_DRAFT_FAR_FROM (same file = one shared head copy) |
 | `EXL3_DRAFT_FAR_FROM` | 2 | first draft position (0-based) that uses the far vocab |
+| `EXL3_DRAFT_GRAPH` | off | MTP draft passes 2..k as one captured CUDA graph per (batch, passes, greedy, DYN) instead of ~7 launches per pass (`draftgraph.py`); the captured body is vLLM's own loop, greedy output bit-identical to the eager loop; batches above `EXL3_DRAFT_GRAPH_BMAX` (4) and any capture failure run eagerly. RTX 5090: +10-14 % step rate at 1-2 streams, 0 at 4 |
 | `EXL3_DRAFT_WEIGHTS` | unset (ref: a 4-bit draft head) | re-quantized draft head / MTP linears (tools/quantize_draft.py) |
 | `EXL3_DRAFT_DYN / _NEAR` | 256 / 128 (sm_120), else 0 / 0 | DRAFT-DYN: up to E extra draft-head rows per request (its most frequent prompt tokens), far / near passes |
 | `EXL3_DRAFT_BIAS` | 0 | DRAFT-DYN: drafter logit bias on prompt tokens |

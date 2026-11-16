@@ -2423,6 +2423,12 @@ def register():
     _patch_int8kv_fa()
     _patch_fastlaunch_eagle()
     _patch_kvw4()
+    if os.environ.get("EXL3_DRAFT_GRAPH") == "1":     # DRAFT-GRAPH (draftgraph.py): draft passes 2..k as one CUDA graph
+        try:
+            from . import draftgraph
+            draftgraph.install()
+        except Exception as e:  # noqa: never block engine start; vLLM's draft loop stays in place
+            logger.warning("exl3: DRAFT-GRAPH not active (%s: %s)", type(e).__name__, e)
     if os.environ.get("EXL3_DRAFT_VOCAB"):
         _patch_mtp_draft_logits()
     if _hwenv("EXL3_TAIL_FUSE", "1", "0") not in ("", "0"):   # TAIL-FUSE (tail_fuse.py)
