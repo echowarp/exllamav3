@@ -238,8 +238,8 @@ Not part of this package. Public builds of the first two ship with [AllRunner](h
 
 - **Out of the box** the public draft vocabulary (AllRunner `data/draft-vocab/public-512.json`, near = far on this GPU)
   and the public K-smoothing table (AllRunner `data/ksmooth/public_r.pt`) are the AllRunner launcher's defaults. Measured against the tables production builds from its own agent traffic: the public K-smoothing
-  table gives NLL +0.037 %, top-5 KL 4.2e-3 and single-stream decode 192 vs 193 tok/s (Arc B70, int4 KV, 126,099
-  held-out GSM8K tokens; no table: NLL +0.43 %, 142 tok/s); the public vocabularies cover the same share of held-out
+  table gives NLL +0.037 % and top-5 KL 4.2e-3 (Arc B70, int4 KV, 126,099 held-out GSM8K tokens; no table: NLL +0.43 %)
+  at the production table's speed (versus no table: the table plus the fused int4 KV write it enables add about +6-7 % on a fast host (Arc B70: 1-stream aggregate 111.8 -> 119.7 tok/s, per-stream decode 139.2 -> 148.5) and up to +35 % per-stream decode on a slow, host-bound CPU (142 -> 192 tok/s on HumanEval prompts)); the public vocabularies cover the same share of held-out
   model outputs (512 / 128 blocks: 99.3 / 94.8 % on GSM8K, 96.5 / 81.6 % on IFBench). Decode speed with the public
   vocabularies has not been measured yet.
 - **Draft vocabulary from your traffic:** rank on text like your model's outputs with exl3xpu
