@@ -41,6 +41,21 @@ Sources: (1) AllRunner [benchmarks/README.md](https://github.com/echowarp/AllRun
 (2) [exl3cuda/RELEASE.md](exl3cuda/RELEASE.md); (3) [AllBroker README](https://github.com/echowarp/AllBroker#readme);
 library rows: the commit messages.
 
+MTP drafting per workload, single stream (SparkInfer's harness shape: 256 tokens, greedy, thinking off; shipped
+defaults, median of 3 reps):
+
+![RTX 5090, single stream by workload](https://github.com/echowarp/AllRunner/raw/main/benchmarks/charts/out/5090-single-stream.png)
+
+int4 KV and EXL3 4.0 bpw against BF16, Q4_K_M and NVFP4: 5-task mean on the published rows' harness, KL vs BF16, and
+GPQA Diamond / IFBench with thinking on (RTX 5090 and Arc B70 runs pooled):
+
+![Q4_K_M-level quality](https://github.com/echowarp/AllRunner/raw/main/benchmarks/charts/out/quality.png)
+
+At the 32k thinking budget of the published NVFP4 runs (RTX 5090 production engine, int4 KV; GPQA 5 runs, AIME 4 runs,
+mean ± 1 s.e.):
+
+![Same 32k thinking budget as the published NVFP4 runs](https://github.com/echowarp/AllRunner/raw/main/benchmarks/charts/out/quality-32k-vs-nvfp4.png)
+
 ## Use it
 
 [AllRunner](https://github.com/echowarp/AllRunner) builds the RTX 5090 image from this repo, echowarp/vllm and AllBroker
